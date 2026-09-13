@@ -26,14 +26,11 @@ jobs:
         run: |
           mkdir -p nn
           
-          # OPTION 1: Download from GitHub Releases/External Host
-          # Replace the URL below with your actual direct download link:
-          # curl -fL -o nn/thrawn-nn-2.nnue "https://github.com/Arzam18/thrawn/releases/download/v1.0.0/thrawn-nn-2.nnue"
+          # Replace this URL with your actual direct download link:
+          curl -fL -o nn/thrawn-nn-2.nnue "https://github.com/Arzam18/thrawn/releases/download/v1.0.0/thrawn-nn-2.nnue"
           
-          # OPTION 2: If committed to Git, ensure the file exists and is not empty
           if [ ! -f "nn/thrawn-nn-2.nnue" ] || [ ! -s "nn/thrawn-nn-2.nnue" ]; then
-            echo "::error:: nn/thrawn-nn-2.nnue was not found or is empty (0 bytes)."
-            echo "Commit the file to your repository under nn/thrawn-nn-2.nnue or uncomment the curl download step above."
+            echo "::error:: nn/thrawn-nn-2.nnue could not be downloaded or is empty."
             exit 1
           fi
 
