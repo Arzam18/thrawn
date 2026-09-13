@@ -1,1 +1,43 @@
+name: Build Thrawn Chess Engine (Android ARM64)
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Build Android ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          unzip -q android-ndk-r26d-linux.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+
+      - name: Check NNUE File
+        run: |
+          mkdir -p nn
+          if [ ! -f "nn/thrawn-nn-2.nnue" ]; then
+            echo "Warning: nn/thrawn-nn-2.nnue not found. Ensure net file is uploaded or downloaded."
+          fi
+
+      - name: Build Binary with Make
+        run: |
+          TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          
+          make TARGET=android ARCH=arm64-neon \
+            CXX=$TOOLCHAIN/aarch64-linux-android24-clang++
+
+      - name: Upload Android Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: thrawn-android-arm64
+          path: build/thrawn-*
