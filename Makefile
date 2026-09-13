@@ -37,6 +37,8 @@ endif
 #                                  CXX=x86_64-w64-mingw32-g++
 #   Linux cross-build:        make TARGET=linux   ARCH=x86-64-avx512 \
 #                                  CXX=x86_64-unknown-linux-gnu-g++
+#   Android cross-build:      make TARGET=android ARCH=arm64-neon   \
+#                                  CXX=aarch64-linux-android24-clang++
 # TARGET defaults to the host OS so a plain `make` is unchanged.
 ###############################################################################
 TARGET ?= $(HOST_OS)
@@ -62,6 +64,10 @@ else ifeq ($(TARGET),linux)
     # Partial-static: bundle libstdc++/libgcc so the binary runs on distros with
     # older GLIBCXX/libgcc than the build host (glibc itself stays dynamic).
     LDFLAGS += -static-libgcc -static-libstdc++
+else ifeq ($(TARGET),android)
+    OS_NAME    := Android
+    EXE_SUFFIX :=
+    STACK_FLAG :=
 else
     OS_NAME    := macOS
     EXE_SUFFIX :=
@@ -123,6 +129,8 @@ endif
 ifeq ($(TARGET),linux)
     CXXFLAGS += -pthread
     LDFLAGS  += -pthread
+else ifeq ($(TARGET),android)
+    # Bionic libc provides POSIX threads directly inside libc
 else ifeq ($(TARGET),macos)
     ifeq ($(ARCH_DETECTED),arm64)
         MACOS_MIN_VERSION := 11.0
@@ -249,10 +257,7 @@ clean:
 distclean: clean
 	$(RMDIR) "$(BUILD_DIR)"
 
-# Build all five distributable binaries into $(BUILD_DIR). Intended to run on an
-# Apple Silicon macOS host with mingw-w64 and the x86_64-unknown-linux-gnu cross
-# toolchain installed (via Homebrew). Objects are cleaned between archs because
-# each uses different -march / -D flags. Run with no extra args.
+# Build all distributable binaries into $(BUILD_DIR).
 release:
 	$(MAKE) clean
 	$(MAKE) TARGET=macos   ARCH=native
