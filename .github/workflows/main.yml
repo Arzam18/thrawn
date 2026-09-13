@@ -22,11 +22,20 @@ jobs:
           unzip -q android-ndk-r26d-linux.zip
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Download NNUE File
+      - name: Fetch and Validate NNUE File
         run: |
           mkdir -p nn
-          # Replace the URL below with your actual direct download link for thrawn-nn-2.nnue
-          curl -L -o nn/thrawn-nn-2.nnue "https://github.com/Arzam18/thrawn/releases/download/v1.0.0/thrawn-nn-2.nnue"
+          
+          # OPTION 1: Download from GitHub Releases/External Host
+          # Replace the URL below with your actual direct download link:
+          # curl -fL -o nn/thrawn-nn-2.nnue "https://github.com/Arzam18/thrawn/releases/download/v1.0.0/thrawn-nn-2.nnue"
+          
+          # OPTION 2: If committed to Git, ensure the file exists and is not empty
+          if [ ! -f "nn/thrawn-nn-2.nnue" ] || [ ! -s "nn/thrawn-nn-2.nnue" ]; then
+            echo "::error:: nn/thrawn-nn-2.nnue was not found or is empty (0 bytes)."
+            echo "Commit the file to your repository under nn/thrawn-nn-2.nnue or uncomment the curl download step above."
+            exit 1
+          fi
 
       - name: Build Binary with Make
         run: |
