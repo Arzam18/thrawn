@@ -14,137 +14,170 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Checkout
-      # ------------------------------------------------------------
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # 2. Install Android NDK
-      # ------------------------------------------------------------
-      - name: Install Android SDK / NDK
+      # ============================================================
+      # ANDROID SDK
+      # ============================================================
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install NDK
+      - name: Install Android NDK
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" \
-                     "platforms;android-24" \
-                     "build-tools;35.0.0" \
-                     "ndk;27.2.12479018"
+          set -e
 
-      # ------------------------------------------------------------
-      # 3. Download the official Thrawn NNUE
-      #
-      # The source repository expects:
-      #   nn/thrawn-nn-2.nnue
-      #
-      # We query the release API rather than hard-coding an
-      # asset URL/name that could change.
-      # ------------------------------------------------------------
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-24" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
+
+      # ============================================================
+      # DOWNLOAD OFFICIAL THRAWN NNUE
+      # ============================================================
       - name: Download Thrawn NNUE
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           mkdir -p nn
 
-          API_URL="https://api.github.com/repos/feftywacky/thrawn-nnue/releases/tags/thrawn-nn-2"
-
-          echo "Querying Thrawn NNUE release..."
+          echo "Getting Thrawn NNUE release information..."
 
           curl -fsSL \
             -H "Accept: application/vnd.github+json" \
-            "$API_URL" \
-            -o /tmp/thrawn_release.json
+            "https://api.github.com/repos/feftywacky/thrawn-nnue/releases/tags/thrawn-nn-2" \
+            -o /tmp/thrawn-release.json
 
-          ASSET_URL="$(
-            python3 - <<'PY'
-import json
-
-with open("/tmp/thrawn_release.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-assets = data.get("assets", [])
-
-for asset in assets:
-    name = asset.get("name", "")
-    url = asset.get("browser_download_url", "")
-
-    if name.endswith(".nnue"):
-        print(url)
-        break
-else:
-    raise SystemExit("ERROR: No .nnue asset found in thrawn-nn-2 release")
-PY
+          NNUE_URL="$(
+            jq -r '
+              .assets[]
+              | select(.name | endswith(".nnue"))
+              | .browser_download_url
+            ' /tmp/thrawn-release.json \
+            | head -n 1
           )"
 
-          echo "NNUE URL:"
-          echo "$ASSET_URL"
+          if [ -z "$NNUE_URL" ] || [ "$NNUE_URL" = "null" ]; then
+            echo "ERROR: Could not find NNUE asset."
+            cat /tmp/thrawn-release.json
+            exit 1
+          fi
+
+          echo "NNUE:"
+          echo "$NNUE_URL"
 
           curl -fL \
             --retry 5 \
             --retry-delay 2 \
-            "$ASSET_URL" \
+            "$NNUE_URL" \
             -o nn/thrawn-nn-2.nnue
 
-          test -s nn/thrawn-nn-2.nnue
+          if [ ! -s nn/thrawn-nn-2.nnue ]; then
+            echo "ERROR: NNUE download failed."
+            exit 1
+          fi
 
           echo
-          echo "NNUE downloaded:"
+          echo "Downloaded NNUE:"
           ls -lh nn/thrawn-nn-2.nnue
 
-      # ------------------------------------------------------------
-      # 4. Locate NDK toolchain
-      # ------------------------------------------------------------
+      # ============================================================
+      # CONFIGURE NDK TOOLCHAIN
+      # ============================================================
       - name: Configure Android toolchain
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          export TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           test -x "$TOOLCHAIN/aarch64-linux-android24-clang++"
-          test -x "$TOOLCHAIN/llvm-ar"
-          test -x "$TOOLCHAIN/llvm-ranlib"
 
           echo "NDK=$NDK" >> "$GITHUB_ENV"
           echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
 
-          echo "NDK:"
+          echo "=========================================="
+          echo "ANDROID NDK"
+          echo "=========================================="
           echo "$NDK"
 
           echo
-          echo "Compiler:"
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" --version
+          echo "=========================================="
+          echo "COMPILER"
+          echo "=========================================="
 
-      # ------------------------------------------------------------
-      # 5. Build
-      #
-      # IMPORTANT:
-      # - USE_NEON selects Thrawn's ARM implementation.
-      # - armv8.2-a+dotprod enables vdotq_s32().
-      # - Android API 24 keeps compatibility with modern Android.
-      # - We do NOT use -march=native because the GitHub runner is x86.
-      # ------------------------------------------------------------
-      - name: Build Thrawn ARM64 Android
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            --version
+
+      # ============================================================
+      # VERIFY ARM64 + NEON + DOTPROD
+      # ============================================================
+      - name: Verify ARM compiler
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
+          echo "Checking ARM64..."
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            -march=armv8.2-a+dotprod \
+            -dM \
+            -E \
+            -x c++ \
+            /dev/null \
+            | grep "__aarch64__"
+
+          echo
+          echo "Checking NEON..."
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            -march=armv8.2-a+dotprod \
+            -dM \
+            -E \
+            -x c++ \
+            /dev/null \
+            | grep "__ARM_NEON"
+
+          echo
+          echo "Checking DOTPROD..."
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            -march=armv8.2-a+dotprod \
+            -dM \
+            -E \
+            -x c++ \
+            /dev/null \
+            | grep "__ARM_FEATURE_DOTPROD"
+
+          echo
+          echo "ARM64 + NEON + DOTPROD confirmed."
+
+      # ============================================================
+      # BUILD
+      # ============================================================
+      - name: Build Thrawn
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf build
           mkdir -p build/obj
 
           CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
 
-          COMMON_FLAGS=(
+          COMMON_FLAGS="
             -std=c++17
             -O3
             -DNDEBUG
             -DRELEASE_BUILD
             -DUSE_NEON
-            '-DNNUE_EMBED_NAME="thrawn-nn-2"'
             -march=armv8.2-a+dotprod
             -fomit-frame-pointer
             -ffunction-sections
@@ -153,49 +186,27 @@ PY
             -Wall
             -Wextra
             -Wno-unused-parameter
-            -MMD
-            -MP
-          )
-
-          INCLUDES=(
-            -Isrc
-          )
+          "
 
           echo "=========================================="
-          echo "THRAWN ANDROID ARM64 BUILD"
+          echo "THRAWN ANDROID BUILD"
           echo "=========================================="
-          echo "Compiler: $CXX"
-          echo "Architecture: armv8.2-a+dotprod"
-          echo "SIMD: NEON + DOTPROD"
-          echo "API: 24"
+          echo "Target : ARM64"
+          echo "SIMD   : NEON"
+          echo "CPU    : ARMv8.2-A"
+          echo "DOTPROD: enabled"
+          echo "API    : Android 24"
+          echo "NDK    : 27.2.12479018"
           echo "=========================================="
 
-          SOURCES=(
-            src/bitboard.cpp
-            src/bitboard_helpers.cpp
-            src/constants.cpp
-            src/evaluation.cpp
-            src/fen.cpp
-            src/globals.cpp
-            src/main.cpp
-            src/misc.cpp
-            src/move_generator.cpp
-            src/move_helpers.cpp
-            src/nnue.cpp
-            src/perft.cpp
-            src/position.cpp
-            src/search.cpp
-            src/threading.cpp
-            src/timeman.cpp
-            src/transposition_table.cpp
-            src/uci.cpp
-            src/zobrist_hashing.cpp
-          )
+          # --------------------------------------------------------
+          # Compile every C++ source file
+          # --------------------------------------------------------
 
-          OBJECTS=()
-
-          for SRC in "${SOURCES[@]}"; do
-            OBJ="build/obj/$(basename "${SRC%.cpp}").o"
+          for SRC in src/*.cpp
+          do
+            NAME="$(basename "$SRC" .cpp)"
+            OBJ="build/obj/${NAME}.o"
 
             echo
             echo "------------------------------------------"
@@ -203,168 +214,159 @@ PY
             echo "------------------------------------------"
 
             "$CXX" \
-              "${COMMON_FLAGS[@]}" \
-              "${INCLUDES[@]}" \
+              $COMMON_FLAGS \
+              -DNNUE_EMBED_NAME='"thrawn-nn-2"' \
+              -Isrc \
               -c "$SRC" \
               -o "$OBJ"
-
-            OBJECTS+=("$OBJ")
           done
 
           # --------------------------------------------------------
-          # Embedded NNUE assembly
+          # Embed official NNUE
           # --------------------------------------------------------
+
           echo
           echo "------------------------------------------"
-          echo "COMPILING EMBEDDED NNUE"
+          echo "EMBEDDING NNUE"
           echo "------------------------------------------"
 
           "$CXX" \
-            "${COMMON_FLAGS[@]}" \
             -DNNUE_EMBED_PATH='"nn/thrawn-nn-2.nnue"' \
             -c src/nnue_embedded_data.S \
             -o build/obj/nnue_embedded_data.o
 
-          OBJECTS+=(
-            build/obj/nnue_embedded_data.o
-          )
-
           # --------------------------------------------------------
           # Link
           # --------------------------------------------------------
+
           echo
           echo "------------------------------------------"
-          echo "LINKING"
+          echo "LINKING THRAWN"
           echo "------------------------------------------"
 
           "$CXX" \
-            "${COMMON_FLAGS[@]}" \
+            $COMMON_FLAGS \
             -Wl,--gc-sections \
             -Wl,--build-id=sha1 \
-            "${OBJECTS[@]}" \
+            build/obj/*.o \
             -o build/thrawn-v3.2-android-arm64-neon-dotprod
 
           chmod +x build/thrawn-v3.2-android-arm64-neon-dotprod
 
           echo
           echo "=========================================="
-          echo "BUILD COMPLETE"
+          echo "BUILD SUCCESSFUL"
           echo "=========================================="
 
-          ls -lh build/thrawn-v3.2-android-arm64-neon-dotprod
+          ls -lh \
+            build/thrawn-v3.2-android-arm64-neon-dotprod
 
-      # ------------------------------------------------------------
-      # 6. Verify Android ELF
-      # ------------------------------------------------------------
-      - name: Verify ARM64 Android ELF
+      # ============================================================
+      # ELF VALIDATION
+      # ============================================================
+      - name: Validate Android binary
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           BIN="build/thrawn-v3.2-android-arm64-neon-dotprod"
 
-          echo "===== FILE ====="
+          echo "=========================================="
+          echo "FILE"
+          echo "=========================================="
+
           file "$BIN"
 
           echo
-          echo "===== ELF HEADER ====="
+          echo "=========================================="
+          echo "ELF HEADER"
+          echo "=========================================="
+
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
             -h "$BIN"
 
           echo
-          echo "===== PROGRAM INTERPRETER ====="
+          echo "=========================================="
+          echo "ARCHITECTURE"
+          echo "=========================================="
+
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-            -l "$BIN" | grep -E "INTERP|Requesting program interpreter" || true
+            -h "$BIN" \
+            | grep "Machine:"
 
           echo
-          echo "===== DYNAMIC LIBRARIES ====="
+          echo "=========================================="
+          echo "DYNAMIC LIBRARIES"
+          echo "=========================================="
+
           "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-            -d "$BIN" | grep NEEDED || true
+            -d "$BIN" \
+            | grep NEEDED || true
 
           echo
-          echo "===== ARCHITECTURE CHECK ====="
+          echo "=========================================="
+          echo "ANDROID LINKER"
+          echo "=========================================="
+
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -l "$BIN" \
+            | grep INTERP || true
+
+          echo
+          echo "=========================================="
+          echo "FINAL FILE CHECK"
+          echo "=========================================="
 
           file "$BIN" | grep -E \
-            "ARM aarch64|ARM64|aarch64" \
-            || {
-              echo "ERROR: output is not an ARM64 executable"
-              exit 1
-            }
-
-      # ------------------------------------------------------------
-      # 7. Verify that x86 SIMD was not accidentally selected
-      # ------------------------------------------------------------
-      - name: Verify ARM build configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking source configuration..."
-
-          test -f src/nnue.cpp
-
-          grep -q "#if defined(USE_NEON)" src/nnue.cpp
-
-          echo "USE_NEON implementation detected."
+            "ARM aarch64|ARM64|aarch64"
 
           echo
-          echo "Checking compiler target..."
+          echo "Android ARM64 binary validation passed."
 
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
-            -march=armv8.2-a+dotprod \
-            -dM -E -x c++ /dev/null \
-            | grep -E \
-              "__aarch64__|__ARM_NEON|__ARM_FEATURE_DOTPROD"
-
-          echo
-          echo "ARM64 + NEON + DOTPROD compiler configuration confirmed."
-
-      # ------------------------------------------------------------
-      # 8. Check binary for accidental x86 architecture strings
-      # ------------------------------------------------------------
-      - name: Check binary architecture metadata
+      # ============================================================
+      # CHECK FOR ACCIDENTAL X86 / GLIBC
+      # ============================================================
+      - name: Check runtime dependencies
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           BIN="build/thrawn-v3.2-android-arm64-neon-dotprod"
 
-          echo "Checking ELF machine:"
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-            -h "$BIN" | grep "Machine:"
-
-          echo
-          echo "Checking for suspicious x86 dependency names:"
+          echo "Checking for Linux/glibc dependencies..."
 
           if strings "$BIN" | grep -Eiq \
-            'libgcc_s|libstdc\+\+|GLIBCXX|GLIBC_2|x86_64-linux|avx512|avx2'; then
-            echo "WARNING: suspicious x86/Linux runtime string detected:"
-            strings "$BIN" | grep -Ei \
-              'libgcc_s|libstdc\+\+|GLIBCXX|GLIBC_2|x86_64-linux|avx512|avx2' \
+            'GLIBC_[0-9]|GLIBCXX_|libstdc\+\+|libgcc_s|x86_64-linux'; then
+
+            echo
+            echo "WARNING: Possible host Linux runtime dependency detected:"
+            strings "$BIN" \
+              | grep -Ei \
+                'GLIBC_[0-9]|GLIBCXX_|libstdc\+\+|libgcc_s|x86_64-linux' \
               || true
           else
-            echo "No suspicious x86/glibc runtime strings found."
+            echo "No obvious glibc/x86 runtime strings found."
           fi
 
-      # ------------------------------------------------------------
-      # 9. Calculate SHA256
-      # ------------------------------------------------------------
-      - name: Generate checksum
+      # ============================================================
+      # CHECKSUM
+      # ============================================================
+      - name: Generate SHA256
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           sha256sum \
             build/thrawn-v3.2-android-arm64-neon-dotprod \
             | tee build/SHA256SUMS.txt
 
-      # ------------------------------------------------------------
-      # 10. Package artifact
-      # ------------------------------------------------------------
-      - name: Package Android engine
+      # ============================================================
+      # PACKAGE
+      # ============================================================
+      - name: Package binary
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
           mkdir -p package
 
@@ -376,26 +378,30 @@ PY
             build/SHA256SUMS.txt \
             package/
 
-          echo "Thrawn Android ARM64 NEON DotProd" \
-            > package/README.txt
+          cat > package/README.txt <<'EOF'
+          Thrawn Android ARM64 NEON DotProd
 
-          echo \
-            "Built with Android NDK 27.2.12479018, API 24, ARMv8.2-A + NEON + DOTPROD." \
-            >> package/README.txt
+          Engine: Thrawn v3.2
+          Target: Android ARM64
+          SIMD: ARM NEON
+          CPU target: ARMv8.2-A + DotProd
+          Android API: 24
+          NDK: 27.2.12479018
 
-          echo \
-            "The thrawn-nn-2 NNUE network is embedded in the executable." \
-            >> package/README.txt
+          The official thrawn-nn-2 NNUE network is embedded
+          into the executable.
+          EOF
 
           cd package
+
           zip -9 \
             ../build/thrawn-v3.2-android-arm64-neon-dotprod.zip \
             *
 
-      # ------------------------------------------------------------
-      # 11. Upload artifact
-      # ------------------------------------------------------------
-      - name: Upload Android binary
+      # ============================================================
+      # ARTIFACT
+      # ============================================================
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: thrawn-android-arm64-neon-dotprod
@@ -404,10 +410,10 @@ PY
             build/thrawn-v3.2-android-arm64-neon-dotprod.zip
             build/SHA256SUMS.txt
 
-      # ------------------------------------------------------------
-      # 12. Automatically create/update GitHub release
-      # ------------------------------------------------------------
-      - name: Publish GitHub release
+      # ============================================================
+      # AUTO RELEASE
+      # ============================================================
+      - name: Create GitHub release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
