@@ -16,33 +16,214 @@ jobs:
     steps:
 
       # ============================================================
-      # CHECKOUT
+      # 1. CHECKOUT
       # ============================================================
+
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # ============================================================
-      # ANDROID SDK
-      # ============================================================
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
 
-      - name: Install Android NDK
+      # ============================================================
+      # 2. FIND ANDROID SDK
+      #
+      # Do NOT use android-actions/setup-android.
+      # GitHub's Ubuntu runner already contains the Android SDK.
+      # ============================================================
+
+      - name: Locate Android SDK
         shell: bash
         run: |
           set -e
 
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
-          sdkmanager \
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            export ANDROID_HOME="/usr/local/lib/android/sdk"
+          fi
+
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          echo
+          echo "Searching for sdkmanager..."
+
+          SDKMANAGER=""
+
+          for candidate in \
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/cmdline-tools/*/bin/sdkmanager" \
+            "$ANDROID_HOME/tools/bin/sdkmanager"
+          do
+            if [ -x "$candidate" ]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f \
+              -name sdkmanager \
+              -perm -111 \
+              2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found."
+            find "$ANDROID_HOME" \
+              -maxdepth 5 \
+              -type f \
+              -name sdkmanager \
+              2>/dev/null || true
+            exit 1
+          fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+          echo
+          echo "Using:"
+          echo "$SDKMANAGER"
+
+          "$SDKMANAGER" --version
+
+
+      # ============================================================
+      # 3. ACCEPT ANDROID LICENSES
+      # ============================================================
+
+      - name: Accept Android licenses
+        shell: bash
+        run: |
+          set -e
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          echo "Android SDK licenses accepted."
+
+
+      # ============================================================
+      # 4. INSTALL ONLY REQUIRED PACKAGES
+      #
+      # IMPORTANT:
+      # We deliberately DO NOT install:
+      #
+      #   tools
+      #
+      # because that package no longer exists.
+      # ============================================================
+
+      - name: Install Android NDK and platform
+        shell: bash
+        run: |
+          set -e
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-24" \
             "build-tools;35.0.0" \
             "ndk;27.2.12479018"
 
+          echo
+          echo "Android packages installed."
+
+
       # ============================================================
-      # DOWNLOAD OFFICIAL THRAWN NNUE
+      # 5. VERIFY NDK
       # ============================================================
+
+      - name: Verify NDK
+        shell: bash
+        run: |
+          set -e
+
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          if [ ! -d "$NDK" ]; then
+            echo "ERROR: NDK directory does not exist:"
+            echo "$NDK"
+            exit 1
+          fi
+
+          if [ ! -x "$TOOLCHAIN/aarch64-linux-android24-clang++" ]; then
+            echo "ERROR: Android ARM64 compiler not found."
+            exit 1
+          fi
+
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+          echo
+          echo "=========================================="
+          echo "NDK"
+          echo "=========================================="
+          echo "$NDK"
+
+          echo
+          echo "=========================================="
+          echo "ARM64 COMPILER"
+          echo "=========================================="
+
+          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
+            --version
+
+
+      # ============================================================
+      # 6. VERIFY ARM64 / NEON / DOTPROD
+      # ============================================================
+
+      - name: Verify ARM64 NEON DotProd
+        shell: bash
+        run: |
+          set -e
+
+          CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
+
+          echo "Testing ARM64..."
+
+          "$CXX" \
+            -march=armv8.2-a+dotprod \
+            -dM \
+            -E \
+            -x c++ \
+            /dev/null \
+            | grep "__aarch64__"
+
+          echo
+          echo "Testing NEON..."
+
+          "$CXX" \
+            -march=armv8.2-a+dotprod \
+            -dM \
+            -E \
+            -x c++ \
+            /dev/null \
+            | grep "__ARM_NEON"
+
+          echo
+          echo "Testing DOTPROD..."
+
+          "$CXX" \
+            -march=armv8.2-a+dotprod \
+            -dM \
+            -E \
+            -x c++ \
+            /dev/null \
+            | grep "__ARM_FEATURE_DOTPROD"
+
+          echo
+          echo "=========================================="
+          echo "ARM64 + NEON + DOTPROD OK"
+          echo "=========================================="
+
+
+      # ============================================================
+      # 7. DOWNLOAD OFFICIAL THRAWN NNUE
+      # ============================================================
+
       - name: Download Thrawn NNUE
         shell: bash
         run: |
@@ -50,7 +231,7 @@ jobs:
 
           mkdir -p nn
 
-          echo "Getting Thrawn NNUE release information..."
+          echo "Downloading official Thrawn NNUE..."
 
           curl -fsSL \
             -H "Accept: application/vnd.github+json" \
@@ -67,12 +248,13 @@ jobs:
           )"
 
           if [ -z "$NNUE_URL" ] || [ "$NNUE_URL" = "null" ]; then
-            echo "ERROR: Could not find NNUE asset."
+            echo "ERROR: No NNUE asset found."
             cat /tmp/thrawn-release.json
             exit 1
           fi
 
-          echo "NNUE:"
+          echo
+          echo "NNUE URL:"
           echo "$NNUE_URL"
 
           curl -fL \
@@ -82,87 +264,47 @@ jobs:
             -o nn/thrawn-nn-2.nnue
 
           if [ ! -s nn/thrawn-nn-2.nnue ]; then
-            echo "ERROR: NNUE download failed."
+            echo "ERROR: NNUE file is empty."
             exit 1
           fi
 
           echo
-          echo "Downloaded NNUE:"
+          echo "NNUE successfully downloaded:"
           ls -lh nn/thrawn-nn-2.nnue
 
+
       # ============================================================
-      # CONFIGURE NDK TOOLCHAIN
+      # 8. SHOW THRAWN SOURCE STRUCTURE
       # ============================================================
-      - name: Configure Android toolchain
+
+      - name: Inspect Thrawn source
         shell: bash
         run: |
           set -e
 
-          export NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
-          export TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          test -x "$TOOLCHAIN/aarch64-linux-android24-clang++"
-
-          echo "NDK=$NDK" >> "$GITHUB_ENV"
-          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
-
           echo "=========================================="
-          echo "ANDROID NDK"
+          echo "SOURCE FILES"
           echo "=========================================="
-          echo "$NDK"
+
+          find src -maxdepth 1 -type f \
+            | sort
 
           echo
           echo "=========================================="
-          echo "COMPILER"
+          echo "MAKEFILE ARCHITECTURE TARGETS"
           echo "=========================================="
 
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
-            --version
+          grep -n \
+            -E "arm64|neon|dotprod|USE_NEON" \
+            Makefile \
+            || true
+
 
       # ============================================================
-      # VERIFY ARM64 + NEON + DOTPROD
+      # 9. BUILD
       # ============================================================
-      - name: Verify ARM compiler
-        shell: bash
-        run: |
-          set -e
 
-          echo "Checking ARM64..."
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
-            -march=armv8.2-a+dotprod \
-            -dM \
-            -E \
-            -x c++ \
-            /dev/null \
-            | grep "__aarch64__"
-
-          echo
-          echo "Checking NEON..."
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
-            -march=armv8.2-a+dotprod \
-            -dM \
-            -E \
-            -x c++ \
-            /dev/null \
-            | grep "__ARM_NEON"
-
-          echo
-          echo "Checking DOTPROD..."
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
-            -march=armv8.2-a+dotprod \
-            -dM \
-            -E \
-            -x c++ \
-            /dev/null \
-            | grep "__ARM_FEATURE_DOTPROD"
-
-          echo
-          echo "ARM64 + NEON + DOTPROD confirmed."
-
-      # ============================================================
-      # BUILD
-      # ============================================================
-      - name: Build Thrawn
+      - name: Build Thrawn Android ARM64
         shell: bash
         run: |
           set -e
@@ -172,11 +314,33 @@ jobs:
 
           CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
 
-          COMMON_FLAGS="
+          echo "=========================================="
+          echo "THRAWN ANDROID ARM64 BUILD"
+          echo "=========================================="
+          echo
+          echo "Compiler:"
+          echo "$CXX"
+          echo
+          echo "Architecture:"
+          echo "ARM64 / AArch64"
+          echo
+          echo "SIMD:"
+          echo "NEON + DotProd"
+          echo
+          echo "Target:"
+          echo "ARMv8.2-A + DotProd"
+          echo
+          echo "Android API:"
+          echo "24"
+          echo
+          echo "NDK:"
+          echo "27.2.12479018"
+          echo "=========================================="
+
+          COMMON_FLAGS=(
             -std=c++17
             -O3
             -DNDEBUG
-            -DRELEASE_BUILD
             -DUSE_NEON
             -march=armv8.2-a+dotprod
             -fomit-frame-pointer
@@ -186,21 +350,10 @@ jobs:
             -Wall
             -Wextra
             -Wno-unused-parameter
-          "
-
-          echo "=========================================="
-          echo "THRAWN ANDROID BUILD"
-          echo "=========================================="
-          echo "Target : ARM64"
-          echo "SIMD   : NEON"
-          echo "CPU    : ARMv8.2-A"
-          echo "DOTPROD: enabled"
-          echo "API    : Android 24"
-          echo "NDK    : 27.2.12479018"
-          echo "=========================================="
+          )
 
           # --------------------------------------------------------
-          # Compile every C++ source file
+          # Compile C++ sources
           # --------------------------------------------------------
 
           for SRC in src/*.cpp
@@ -210,24 +363,24 @@ jobs:
 
             echo
             echo "------------------------------------------"
-            echo "COMPILING: $SRC"
+            echo "COMPILING"
+            echo "$SRC"
             echo "------------------------------------------"
 
             "$CXX" \
-              $COMMON_FLAGS \
-              -DNNUE_EMBED_NAME='"thrawn-nn-2"' \
+              "${COMMON_FLAGS[@]}" \
               -Isrc \
               -c "$SRC" \
               -o "$OBJ"
           done
 
           # --------------------------------------------------------
-          # Embed official NNUE
+          # Embed NNUE
           # --------------------------------------------------------
 
           echo
           echo "------------------------------------------"
-          echo "EMBEDDING NNUE"
+          echo "COMPILING EMBEDDED NNUE"
           echo "------------------------------------------"
 
           "$CXX" \
@@ -236,22 +389,22 @@ jobs:
             -o build/obj/nnue_embedded_data.o
 
           # --------------------------------------------------------
-          # Link
+          # LINK
           # --------------------------------------------------------
 
           echo
           echo "------------------------------------------"
-          echo "LINKING THRAWN"
+          echo "LINKING"
           echo "------------------------------------------"
 
           "$CXX" \
-            $COMMON_FLAGS \
+            "${COMMON_FLAGS[@]}" \
             -Wl,--gc-sections \
             -Wl,--build-id=sha1 \
             build/obj/*.o \
-            -o build/thrawn-v3.2-android-arm64-neon-dotprod
+            -o build/thrawn-android-arm64-neon-dotprod
 
-          chmod +x build/thrawn-v3.2-android-arm64-neon-dotprod
+          chmod +x build/thrawn-android-arm64-neon-dotprod
 
           echo
           echo "=========================================="
@@ -259,17 +412,21 @@ jobs:
           echo "=========================================="
 
           ls -lh \
-            build/thrawn-v3.2-android-arm64-neon-dotprod
+            build/thrawn-android-arm64-neon-dotprod
+
 
       # ============================================================
-      # ELF VALIDATION
+      # 10. ELF VALIDATION
       # ============================================================
-      - name: Validate Android binary
+
+      - name: Validate binary
         shell: bash
         run: |
           set -e
 
-          BIN="build/thrawn-v3.2-android-arm64-neon-dotprod"
+          BIN="build/thrawn-android-arm64-neon-dotprod"
+
+          LLVM_READelf="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
 
           echo "=========================================="
           echo "FILE"
@@ -279,91 +436,93 @@ jobs:
 
           echo
           echo "=========================================="
-          echo "ELF HEADER"
+          echo "ELF MACHINE"
           echo "=========================================="
 
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-            -h "$BIN"
-
-          echo
-          echo "=========================================="
-          echo "ARCHITECTURE"
-          echo "=========================================="
-
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+          "$LLVM_READelf" \
             -h "$BIN" \
             | grep "Machine:"
 
           echo
           echo "=========================================="
-          echo "DYNAMIC LIBRARIES"
+          echo "DYNAMIC DEPENDENCIES"
           echo "=========================================="
 
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+          "$LLVM_READelf" \
             -d "$BIN" \
             | grep NEEDED || true
 
           echo
           echo "=========================================="
-          echo "ANDROID LINKER"
+          echo "INTERPRETER"
           echo "=========================================="
 
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+          "$LLVM_READelf" \
             -l "$BIN" \
             | grep INTERP || true
 
           echo
           echo "=========================================="
-          echo "FINAL FILE CHECK"
+          echo "ARM64 CHECK"
           echo "=========================================="
 
-          file "$BIN" | grep -E \
-            "ARM aarch64|ARM64|aarch64"
+          file "$BIN" \
+            | grep -E \
+              "ARM aarch64|ARM64|aarch64"
 
           echo
-          echo "Android ARM64 binary validation passed."
+          echo "Binary validation passed."
+
 
       # ============================================================
-      # CHECK FOR ACCIDENTAL X86 / GLIBC
+      # 11. CHECK FOR HOST LINUX DEPENDENCIES
       # ============================================================
+
       - name: Check runtime dependencies
         shell: bash
         run: |
           set -e
 
-          BIN="build/thrawn-v3.2-android-arm64-neon-dotprod"
+          BIN="build/thrawn-android-arm64-neon-dotprod"
 
-          echo "Checking for Linux/glibc dependencies..."
+          echo "Checking for obvious host Linux dependencies..."
 
-          if strings "$BIN" | grep -Eiq \
-            'GLIBC_[0-9]|GLIBCXX_|libstdc\+\+|libgcc_s|x86_64-linux'; then
+          if strings "$BIN" \
+            | grep -Eiq \
+              'GLIBC_[0-9]|GLIBCXX_|x86_64-linux|libstdc\+\+|libgcc_s'; then
 
             echo
-            echo "WARNING: Possible host Linux runtime dependency detected:"
+            echo "WARNING:"
+            echo "Possible host Linux dependency detected."
+
             strings "$BIN" \
               | grep -Ei \
-                'GLIBC_[0-9]|GLIBCXX_|libstdc\+\+|libgcc_s|x86_64-linux' \
+                'GLIBC_[0-9]|GLIBCXX_|x86_64-linux|libstdc\+\+|libgcc_s' \
               || true
           else
-            echo "No obvious glibc/x86 runtime strings found."
+            echo "No obvious glibc/x86 runtime dependency detected."
           fi
 
+
       # ============================================================
-      # CHECKSUM
+      # 12. CHECKSUM
       # ============================================================
+
       - name: Generate SHA256
         shell: bash
         run: |
           set -e
 
           sha256sum \
-            build/thrawn-v3.2-android-arm64-neon-dotprod \
+            build/thrawn-android-arm64-neon-dotprod \
             | tee build/SHA256SUMS.txt
 
+
       # ============================================================
-      # PACKAGE
+      # 13. PACKAGE
       # ============================================================
-      - name: Package binary
+
+      - name: Package engine
         shell: bash
         run: |
           set -e
@@ -371,7 +530,7 @@ jobs:
           mkdir -p package
 
           cp \
-            build/thrawn-v3.2-android-arm64-neon-dotprod \
+            build/thrawn-android-arm64-neon-dotprod \
             package/
 
           cp \
@@ -381,48 +540,53 @@ jobs:
           cat > package/README.txt <<'EOF'
           Thrawn Android ARM64 NEON DotProd
 
-          Engine: Thrawn v3.2
-          Target: Android ARM64
+          Engine: Thrawn
+          Platform: Android
+          Architecture: ARM64 / AArch64
           SIMD: ARM NEON
           CPU target: ARMv8.2-A + DotProd
           Android API: 24
           NDK: 27.2.12479018
 
-          The official thrawn-nn-2 NNUE network is embedded
+          The official Thrawn NNUE network is embedded
           into the executable.
           EOF
 
           cd package
 
           zip -9 \
-            ../build/thrawn-v3.2-android-arm64-neon-dotprod.zip \
+            ../build/thrawn-android-arm64-neon-dotprod.zip \
             *
 
+
       # ============================================================
-      # ARTIFACT
+      # 14. UPLOAD ARTIFACT
       # ============================================================
-      - name: Upload artifact
+
+      - name: Upload Android engine
         uses: actions/upload-artifact@v4
         with:
           name: thrawn-android-arm64-neon-dotprod
           path: |
-            build/thrawn-v3.2-android-arm64-neon-dotprod
-            build/thrawn-v3.2-android-arm64-neon-dotprod.zip
+            build/thrawn-android-arm64-neon-dotprod
+            build/thrawn-android-arm64-neon-dotprod.zip
             build/SHA256SUMS.txt
 
+
       # ============================================================
-      # AUTO RELEASE
+      # 15. AUTO RELEASE
       # ============================================================
+
       - name: Create GitHub release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: android-v3.2-${{ github.run_number }}
-          name: Thrawn v3.2 Android ARM64 NEON DotProd #${{ github.run_number }}
+          tag_name: android-${{ github.run_number }}
+          name: Thrawn Android ARM64 NEON DotProd #${{ github.run_number }}
           generate_release_notes: true
           files: |
-            build/thrawn-v3.2-android-arm64-neon-dotprod
-            build/thrawn-v3.2-android-arm64-neon-dotprod.zip
+            build/thrawn-android-arm64-neon-dotprod
+            build/thrawn-android-arm64-neon-dotprod.zip
             build/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
