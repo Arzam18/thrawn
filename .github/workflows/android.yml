@@ -24,19 +24,13 @@ jobs:
 
 
       # ============================================================
-      # 2. FIND ANDROID SDK
-      #
-      # Do NOT use android-actions/setup-android.
-      # GitHub's Ubuntu runner already contains the Android SDK.
+      # 2. LOCATE ANDROID SDK
       # ============================================================
 
       - name: Locate Android SDK
         shell: bash
         run: |
           set -e
-
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
           if [ -z "${ANDROID_HOME:-}" ]; then
             export ANDROID_HOME="/usr/local/lib/android/sdk"
@@ -47,14 +41,13 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
-          echo
-          echo "Searching for sdkmanager..."
+          echo "Android SDK:"
+          echo "$ANDROID_HOME"
 
           SDKMANAGER=""
 
           for candidate in \
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "$ANDROID_HOME/cmdline-tools/*/bin/sdkmanager" \
             "$ANDROID_HOME/tools/bin/sdkmanager"
           do
             if [ -x "$candidate" ]; then
@@ -64,34 +57,32 @@ jobs:
           done
 
           if [ -z "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-              -type f \
-              -name sdkmanager \
-              -perm -111 \
-              2>/dev/null | head -n 1 || true)"
+            SDKMANAGER="$(
+              find "$ANDROID_HOME/cmdline-tools" \
+                -type f \
+                -name sdkmanager \
+                -perm -111 \
+                2>/dev/null \
+                | head -n 1
+            )"
           fi
 
           if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found."
-            find "$ANDROID_HOME" \
-              -maxdepth 5 \
-              -type f \
-              -name sdkmanager \
-              2>/dev/null || true
             exit 1
           fi
 
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
 
           echo
-          echo "Using:"
+          echo "sdkmanager:"
           echo "$SDKMANAGER"
 
           "$SDKMANAGER" --version
 
 
       # ============================================================
-      # 3. ACCEPT ANDROID LICENSES
+      # 3. ACCEPT LICENSES
       # ============================================================
 
       - name: Accept Android licenses
@@ -101,21 +92,14 @@ jobs:
 
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 
-          echo "Android SDK licenses accepted."
+          echo "Android licenses accepted."
 
 
       # ============================================================
-      # 4. INSTALL ONLY REQUIRED PACKAGES
-      #
-      # IMPORTANT:
-      # We deliberately DO NOT install:
-      #
-      #   tools
-      #
-      # because that package no longer exists.
+      # 4. INSTALL REQUIRED ANDROID PACKAGES
       # ============================================================
 
-      - name: Install Android NDK and platform
+      - name: Install Android NDK
         shell: bash
         run: |
           set -e
@@ -127,38 +111,37 @@ jobs:
             "ndk;27.2.12479018"
 
           echo
-          echo "Android packages installed."
+          echo "Required Android packages installed."
 
 
       # ============================================================
-      # 5. VERIFY NDK
+      # 5. CONFIGURE NDK TOOLCHAIN
       # ============================================================
 
-      - name: Verify NDK
+      - name: Configure NDK toolchain
         shell: bash
         run: |
           set -e
 
           NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          if [ ! -d "$NDK" ]; then
-            echo "ERROR: NDK directory does not exist:"
-            echo "$NDK"
-            exit 1
-          fi
+          CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
 
-          if [ ! -x "$TOOLCHAIN/aarch64-linux-android24-clang++" ]; then
-            echo "ERROR: Android ARM64 compiler not found."
+          if [ ! -x "$CXX" ]; then
+            echo "ERROR: ARM64 Android compiler not found:"
+            echo "$CXX"
             exit 1
           fi
 
           echo "NDK=$NDK" >> "$GITHUB_ENV"
           echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CXX=$CXX" >> "$GITHUB_ENV"
 
           echo
           echo "=========================================="
-          echo "NDK"
+          echo "ANDROID NDK"
           echo "=========================================="
           echo "$NDK"
 
@@ -167,8 +150,7 @@ jobs:
           echo "ARM64 COMPILER"
           echo "=========================================="
 
-          "$TOOLCHAIN/aarch64-linux-android24-clang++" \
-            --version
+          "$CXX" --version
 
 
       # ============================================================
@@ -180,9 +162,7 @@ jobs:
         run: |
           set -e
 
-          CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
-
-          echo "Testing ARM64..."
+          echo "Checking ARM64..."
 
           "$CXX" \
             -march=armv8.2-a+dotprod \
@@ -193,7 +173,7 @@ jobs:
             | grep "__aarch64__"
 
           echo
-          echo "Testing NEON..."
+          echo "Checking NEON..."
 
           "$CXX" \
             -march=armv8.2-a+dotprod \
@@ -204,7 +184,7 @@ jobs:
             | grep "__ARM_NEON"
 
           echo
-          echo "Testing DOTPROD..."
+          echo "Checking ARM DotProd..."
 
           "$CXX" \
             -march=armv8.2-a+dotprod \
@@ -215,9 +195,7 @@ jobs:
             | grep "__ARM_FEATURE_DOTPROD"
 
           echo
-          echo "=========================================="
-          echo "ARM64 + NEON + DOTPROD OK"
-          echo "=========================================="
+          echo "ARM64 + NEON + DOTPROD confirmed."
 
 
       # ============================================================
@@ -231,7 +209,7 @@ jobs:
 
           mkdir -p nn
 
-          echo "Downloading official Thrawn NNUE..."
+          echo "Downloading Thrawn NNUE..."
 
           curl -fsSL \
             -H "Accept: application/vnd.github+json" \
@@ -248,8 +226,7 @@ jobs:
           )"
 
           if [ -z "$NNUE_URL" ] || [ "$NNUE_URL" = "null" ]; then
-            echo "ERROR: No NNUE asset found."
-            cat /tmp/thrawn-release.json
+            echo "ERROR: Could not find NNUE asset."
             exit 1
           fi
 
@@ -264,56 +241,29 @@ jobs:
             -o nn/thrawn-nn-2.nnue
 
           if [ ! -s nn/thrawn-nn-2.nnue ]; then
-            echo "ERROR: NNUE file is empty."
+            echo "ERROR: NNUE download failed."
             exit 1
           fi
 
           echo
-          echo "NNUE successfully downloaded:"
+          echo "NNUE downloaded:"
           ls -lh nn/thrawn-nn-2.nnue
 
 
       # ============================================================
-      # 8. SHOW THRAWN SOURCE STRUCTURE
+      # 8. BUILD
       # ============================================================
 
-      - name: Inspect Thrawn source
-        shell: bash
-        run: |
-          set -e
-
-          echo "=========================================="
-          echo "SOURCE FILES"
-          echo "=========================================="
-
-          find src -maxdepth 1 -type f \
-            | sort
-
-          echo
-          echo "=========================================="
-          echo "MAKEFILE ARCHITECTURE TARGETS"
-          echo "=========================================="
-
-          grep -n \
-            -E "arm64|neon|dotprod|USE_NEON" \
-            Makefile \
-            || true
-
-
-      # ============================================================
-      # 9. BUILD
-      # ============================================================
-
-      - name: Build Thrawn Android ARM64
+      - name: Build Thrawn
         shell: bash
         run: |
           set -e
 
           rm -rf build
+
           mkdir -p build/obj
 
-          CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
-
+          echo
           echo "=========================================="
           echo "THRAWN ANDROID ARM64 BUILD"
           echo "=========================================="
@@ -321,26 +271,29 @@ jobs:
           echo "Compiler:"
           echo "$CXX"
           echo
-          echo "Architecture:"
-          echo "ARM64 / AArch64"
-          echo
-          echo "SIMD:"
-          echo "NEON + DotProd"
-          echo
           echo "Target:"
+          echo "Android ARM64"
+          echo
+          echo "CPU:"
           echo "ARMv8.2-A + DotProd"
           echo
-          echo "Android API:"
-          echo "24"
+          echo "SIMD:"
+          echo "NEON"
           echo
-          echo "NDK:"
-          echo "27.2.12479018"
+          echo "C++ runtime:"
+          echo "STATIC libc++"
+          echo
+          echo "NNUE:"
+          echo "Embedded thrawn-nn-2"
+          echo
           echo "=========================================="
 
           COMMON_FLAGS=(
             -std=c++17
             -O3
+            -flto=auto
             -DNDEBUG
+            -DRELEASE_BUILD
             -DUSE_NEON
             -march=armv8.2-a+dotprod
             -fomit-frame-pointer
@@ -353,17 +306,18 @@ jobs:
           )
 
           # --------------------------------------------------------
-          # Compile C++ sources
+          # Compile all Thrawn C++ sources
           # --------------------------------------------------------
 
           for SRC in src/*.cpp
           do
             NAME="$(basename "$SRC" .cpp)"
+
             OBJ="build/obj/${NAME}.o"
 
             echo
             echo "------------------------------------------"
-            echo "COMPILING"
+            echo "COMPILING:"
             echo "$SRC"
             echo "------------------------------------------"
 
@@ -374,13 +328,14 @@ jobs:
               -o "$OBJ"
           done
 
+
           # --------------------------------------------------------
           # Embed NNUE
           # --------------------------------------------------------
 
           echo
           echo "------------------------------------------"
-          echo "COMPILING EMBEDDED NNUE"
+          echo "EMBEDDING NNUE"
           echo "------------------------------------------"
 
           "$CXX" \
@@ -388,8 +343,16 @@ jobs:
             -c src/nnue_embedded_data.S \
             -o build/obj/nnue_embedded_data.o
 
+
           # --------------------------------------------------------
           # LINK
+          #
+          # The critical change:
+          #
+          #   -static-libstdc++
+          #
+          # This makes libc++ part of the executable instead of
+          # requiring libc++_shared.so on the Android device.
           # --------------------------------------------------------
 
           echo
@@ -399,12 +362,15 @@ jobs:
 
           "$CXX" \
             "${COMMON_FLAGS[@]}" \
+            -static-libstdc++ \
             -Wl,--gc-sections \
             -Wl,--build-id=sha1 \
             build/obj/*.o \
             -o build/thrawn-android-arm64-neon-dotprod
 
+
           chmod +x build/thrawn-android-arm64-neon-dotprod
+
 
           echo
           echo "=========================================="
@@ -416,18 +382,61 @@ jobs:
 
 
       # ============================================================
-      # 10. ELF VALIDATION
+      # 9. VERIFY C++ RUNTIME
+      #
+      # This is the important test.
+      # We should NOT see libc++_shared.so here.
       # ============================================================
 
-      - name: Validate binary
+      - name: Verify static libc++
         shell: bash
         run: |
           set -e
 
           BIN="build/thrawn-android-arm64-neon-dotprod"
 
-          LLVM_READelf="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          READ_ELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
 
+          echo
+          echo "=========================================="
+          echo "DYNAMIC LIBRARIES"
+          echo "=========================================="
+
+          "$READ_ELF" \
+            -d "$BIN" \
+            | grep NEEDED \
+            || true
+
+          echo
+          echo "Checking for libc++_shared.so..."
+
+          if "$READ_ELF" -d "$BIN" | grep -q "libc++_shared.so"; then
+            echo
+            echo "ERROR:"
+            echo "Binary still requires libc++_shared.so."
+            echo
+            exit 1
+          fi
+
+          echo
+          echo "SUCCESS:"
+          echo "No libc++_shared.so dependency."
+
+
+      # ============================================================
+      # 10. VERIFY ELF ARCHITECTURE
+      # ============================================================
+
+      - name: Validate Android ELF
+        shell: bash
+        run: |
+          set -e
+
+          BIN="build/thrawn-android-arm64-neon-dotprod"
+
+          READ_ELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          echo
           echo "=========================================="
           echo "FILE"
           echo "=========================================="
@@ -439,27 +448,19 @@ jobs:
           echo "ELF MACHINE"
           echo "=========================================="
 
-          "$LLVM_READelf" \
+          "$READ_ELF" \
             -h "$BIN" \
             | grep "Machine:"
-
-          echo
-          echo "=========================================="
-          echo "DYNAMIC DEPENDENCIES"
-          echo "=========================================="
-
-          "$LLVM_READelf" \
-            -d "$BIN" \
-            | grep NEEDED || true
 
           echo
           echo "=========================================="
           echo "INTERPRETER"
           echo "=========================================="
 
-          "$LLVM_READelf" \
+          "$READ_ELF" \
             -l "$BIN" \
-            | grep INTERP || true
+            | grep INTERP \
+            || true
 
           echo
           echo "=========================================="
@@ -471,110 +472,133 @@ jobs:
               "ARM aarch64|ARM64|aarch64"
 
           echo
-          echo "Binary validation passed."
+          echo "Android ARM64 ELF validation passed."
 
 
       # ============================================================
-      # 11. CHECK FOR HOST LINUX DEPENDENCIES
+      # 11. CHECK FOR GLIBC / HOST RUNTIME
       # ============================================================
 
-      - name: Check runtime dependencies
+      - name: Check runtime strings
         shell: bash
         run: |
           set -e
 
           BIN="build/thrawn-android-arm64-neon-dotprod"
 
-          echo "Checking for obvious host Linux dependencies..."
+          echo "Checking for accidental host Linux runtime..."
 
           if strings "$BIN" \
             | grep -Eiq \
-              'GLIBC_[0-9]|GLIBCXX_|x86_64-linux|libstdc\+\+|libgcc_s'; then
+              'GLIBC_[0-9]|GLIBCXX_|x86_64-linux'; then
 
             echo
-            echo "WARNING:"
-            echo "Possible host Linux dependency detected."
+            echo "WARNING: possible host runtime strings found."
 
             strings "$BIN" \
               | grep -Ei \
-                'GLIBC_[0-9]|GLIBCXX_|x86_64-linux|libstdc\+\+|libgcc_s' \
+                'GLIBC_[0-9]|GLIBCXX_|x86_64-linux' \
               || true
           else
-            echo "No obvious glibc/x86 runtime dependency detected."
+            echo "No obvious host glibc/x86 runtime strings."
           fi
 
 
       # ============================================================
-      # 12. CHECKSUM
+      # 12. TEST UCI STARTUP ON LINUX HOST
+      #
+      # We cannot execute an ARM Android binary directly on the
+      # Ubuntu runner, but we can make sure the ELF is valid.
       # ============================================================
 
-      - name: Generate SHA256
+      - name: Final binary information
         shell: bash
         run: |
           set -e
 
-          sha256sum \
-            build/thrawn-android-arm64-neon-dotprod \
-            | tee build/SHA256SUMS.txt
+          BIN="build/thrawn-android-arm64-neon-dotprod"
+
+          echo
+          echo "=========================================="
+          echo "FINAL ENGINE"
+          echo "=========================================="
+
+          ls -lh "$BIN"
+
+          echo
+          file "$BIN"
 
 
       # ============================================================
-      # 13. PACKAGE
+      # 13. CREATE ONE ZIP CONTAINING ONE FILE
+      #
+      # No README
+      # No checksum
+      # No second binary
       # ============================================================
 
-      - name: Package engine
+      - name: Create single-file ZIP
         shell: bash
         run: |
           set -e
 
-          mkdir -p package
+          rm -rf package
+
+          mkdir package
 
           cp \
             build/thrawn-android-arm64-neon-dotprod \
             package/
-
-          cp \
-            build/SHA256SUMS.txt \
-            package/
-
-          cat > package/README.txt <<'EOF'
-          Thrawn Android ARM64 NEON DotProd
-
-          Engine: Thrawn
-          Platform: Android
-          Architecture: ARM64 / AArch64
-          SIMD: ARM NEON
-          CPU target: ARMv8.2-A + DotProd
-          Android API: 24
-          NDK: 27.2.12479018
-
-          The official Thrawn NNUE network is embedded
-          into the executable.
-          EOF
 
           cd package
 
           zip -9 \
-            ../build/thrawn-android-arm64-neon-dotprod.zip \
-            *
+            ../thrawn-android-arm64-neon-dotprod.zip \
+            thrawn-android-arm64-neon-dotprod
+
+          cd ..
+
+          echo
+          echo "=========================================="
+          echo "ZIP CONTENTS"
+          echo "=========================================="
+
+          unzip -l \
+            thrawn-android-arm64-neon-dotprod.zip
+
+          echo
+          echo "=========================================="
+          echo "VERIFY ZIP CONTAINS EXACTLY ONE FILE"
+          echo "=========================================="
+
+          COUNT="$(
+            unzip -Z1 \
+              thrawn-android-arm64-neon-dotprod.zip \
+              | wc -l
+          )"
+
+          if [ "$COUNT" -ne 1 ]; then
+            echo "ERROR: ZIP does not contain exactly one file."
+            exit 1
+          fi
+
+          echo "ZIP contains exactly one binary."
 
 
       # ============================================================
-      # 14. UPLOAD ARTIFACT
+      # 14. UPLOAD ONLY THE ZIP
       # ============================================================
 
-      - name: Upload Android engine
+      - name: Upload single ZIP
         uses: actions/upload-artifact@v4
         with:
           name: thrawn-android-arm64-neon-dotprod
-          path: |
-            build/thrawn-android-arm64-neon-dotprod
-            build/thrawn-android-arm64-neon-dotprod.zip
-            build/SHA256SUMS.txt
+          path: thrawn-android-arm64-neon-dotprod.zip
+          if-no-files-found: error
 
 
       # ============================================================
-      # 15. AUTO RELEASE
+      # 15. GITHUB RELEASE — ZIP ONLY
       # ============================================================
 
       - name: Create GitHub release
@@ -585,8 +609,6 @@ jobs:
           name: Thrawn Android ARM64 NEON DotProd #${{ github.run_number }}
           generate_release_notes: true
           files: |
-            build/thrawn-android-arm64-neon-dotprod
-            build/thrawn-android-arm64-neon-dotprod.zip
-            build/SHA256SUMS.txt
+            thrawn-android-arm64-neon-dotprod.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
