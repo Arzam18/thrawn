@@ -13,6 +13,7 @@ void init_position_tables(thrawn::Position* pos) {
     init_leaping_attacks(pos);
     init_sliding_attacks(pos, bishop);
     init_sliding_attacks(pos, rook);
+    init_line_tables(pos);
     init_hashkeys(pos);
 }
 
@@ -36,13 +37,17 @@ std::array<std::array<uint64_t, 512>, 64> Position::bishop_attacks{};
 std::array<std::array<uint64_t, 4096>, 64> Position::rook_attacks{};
 #endif
 
+std::array<std::array<uint64_t, 64>, 64> Position::between_bb{};
+std::array<std::array<uint64_t, 64>, 64> Position::line_bb{};
+
 uint64_t Position::piece_hashkey[12][64]{};
 uint64_t Position::enpassant_hashkey[64]{};
 uint64_t Position::castling_hashkey[16]{};
 uint64_t Position::colour_to_move_hashkey = 0ULL;
 
 NnueStack::NnueStack()
-    : states(std::make_unique<std::array<NnueState, MAX_DEPTH + 1>>()) {}
+    : states(std::make_unique<std::array<NnueState, MAX_DEPTH + 1>>()),
+      cache(std::make_unique<NnueRefreshCache>()) {}
 
 NnueStack::NnueStack(const NnueStack& other)
     : NnueStack() {
@@ -71,8 +76,8 @@ void NnueStack::copy_up_to(const NnueStack& other, int ply) {
     }
     for (int i = limit + 1; i <= MAX_DEPTH; ++i) {
         (*states)[i].valid = false;
-        (*states)[i].white_acc_source_ply = -1;
-        (*states)[i].black_acc_source_ply = -1;
+        (*states)[i].white_acc_ply = -1;
+        (*states)[i].black_acc_ply = -1;
     }
 }
 

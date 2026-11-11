@@ -73,8 +73,8 @@ constexpr int kFtActivationHalf = static_cast<int>(kExpectedFtSize) / 2;
 constexpr int kFc1InputPaddedSize = 64;
 constexpr int kFc2OutputSize = 1;
 constexpr int kKingPlaneOffset = 10 * 64;
-constexpr double kCpPerStockfishScore = 100.0 / 208.0;
-constexpr int8_t kLocalAccumulatorSource = -1;
+constexpr double kCpPerNetworkScore = 100.0 / 208.0;
+constexpr int8_t kUncomputedAccumulator = -1;
 
 static_assert(kExpectedFc0OutputSize == kExpectedHiddenSize + kExpectedForwardSize,
               "HalfKAv2_hm fc0 shape mismatch");
@@ -199,6 +199,60 @@ struct IntEvaluationResult {
     }
 };
 
+// Exact replacement for div_round_by_scale(value, scale) with a fixed scale in
+// [1, 255], used on the per-eval output path so it costs a multiply and a shift
+// instead of a 64-bit hardware division. The rounded magnitude n = |value| +
+// scale/2 is divided by a multiply with m = ceil(2^(N+l) / scale), l =
+// ceil(log2(scale)), N = kMagicBits. Granlund & Montgomery (1994, Thm 4.2):
+// since m*scale - 2^(N+l) <= scale - 1 < 2^l, floor(n*m / 2^(N+l)) equals
+// floor(n / scale) for every 0 <= n < 2^N. With scale > 2^(l-1), m <= 2^(N+1),
+// so n*m < 2^(2N+1) = 2^63 cannot overflow. Magnitudes >= 2^N (unreachable for
+// this network's int32 dot products of at most ~2^25, but handled anyway) fall
+// back to the real division, so the result equals div_round_by_scale for every
+// int64 input: same rounding (half away from zero), same sign handling.
+struct RoundingDivider {
+    static constexpr uint32_t kMagicBits = 31;
+
+    uint64_t magic = 0;
+    uint32_t shift = 0;
+    uint32_t half = 0;
+    uint32_t divisor = 1;
+
+    bool init(int32_t scale) {
+        if (scale <= 0 || scale > 255) {
+            return false;
+        }
+        const uint32_t d = static_cast<uint32_t>(scale);
+        uint32_t l = 0;
+        while ((1U << l) < d) {
+            ++l;
+        }
+        shift = kMagicBits + l;
+        magic = ((uint64_t{1} << shift) + d - 1) / d;
+        // The integer d > 2^(l-1) keeps 2^(N+l) / d < 2^32 with a gap far wider
+        // than the ceiling's rounding, so m < 2^32 for every scale in [1, 255]. The
+        // NEON forward pass relies on this for its 32x32->64-bit multiply.
+        if (magic > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        half = d / 2U;
+        divisor = d;
+        return true;
+    }
+
+    int64_t div_round(int64_t value) const {
+        const uint64_t magnitude = value >= 0
+            ? static_cast<uint64_t>(value)
+            : static_cast<uint64_t>(-value);
+        const uint64_t n = magnitude + half;
+        const uint64_t quotient = (n < (uint64_t{1} << kMagicBits))
+            ? (n * magic) >> shift
+            : n / divisor;
+        const int64_t signed_quotient = static_cast<int64_t>(quotient);
+        return value >= 0 ? signed_quotient : -signed_quotient;
+    }
+};
+
 struct LoadedNetwork {
     uint32_t version = 0;
     uint32_t output_perspective = 0;
@@ -226,11 +280,24 @@ struct LoadedNetwork {
     float inv_fc1_scale = 0.0f;
     float inv_fc2_scale = 0.0f;
 
+    // Precomputed output-path "rounding glue": exact multiply-shift dividers for
+    // the per-eval div_round_by_scale calls, and the SqrCReLU renormalization
+    // screlu_lut[c] == div_round_by_scale(c * c, qfc0) for every uint8 c.
+    RoundingDivider div_act_one;
+    RoundingDivider div_qfc0;
+    RoundingDivider div_qfc1;
+    std::array<uint8_t, 256> screlu_lut{};
+
     std::array<int16_t, kExpectedFtSize> ft_bias{};
     AlignedFtWeights ft_weight;
 
     std::array<int32_t, kExpectedFc0OutputSize> fc0_bias{};
     alignas(64) std::array<std::array<int8_t, kFc0InputSize>, kExpectedFc0OutputSize> fc0_weight_t{};
+#if defined(USE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    // fc0 weights again, input-major for the chunk-sparse kernel: for each 4-input
+    // chunk c, 16 bytes per output group k hold weights[4k + o][4c + t] at o * 4 + t.
+    alignas(64) std::array<int8_t, kFc0InputSize * kExpectedFc0OutputSize> fc0_weight_chunked{};
+#endif
 
     std::array<int32_t, kExpectedFc1OutputSize> fc1_bias{};
     alignas(64) std::array<std::array<int8_t, kFc1InputPaddedSize>, kExpectedFc1OutputSize> fc1_weight_t{};
@@ -245,6 +312,10 @@ struct LoadedNetwork {
 std::mutex g_network_mutex;
 std::shared_ptr<const LoadedNetwork> g_network_owner;
 std::atomic<const LoadedNetwork*> g_network_raw{nullptr};
+// Bumped on every network (re)load or unload. Refresh-cache entries record the
+// generation they were built for, so a stale entry is rebuilt on first use.
+// Starts at 1 so zero-initialized cache entries are always stale.
+std::atomic<uint32_t> g_network_generation{1};
 
 bool host_is_little_endian() {
     const uint16_t endian_probe = 0x0102;
@@ -404,15 +475,15 @@ int engine_to_model_square(int square) {
     return square ^ 56;
 }
 
-bool is_white_piece(int piece) {
+constexpr bool is_white_piece(int piece) {
     return piece >= P && piece <= K;
 }
 
-bool is_king_piece(int piece) {
+constexpr bool is_king_piece(int piece) {
     return piece == K || piece == k;
 }
 
-int piece_type_index(int piece) {
+constexpr int piece_type_index(int piece) {
     switch (piece) {
         case P:
         case p:
@@ -434,7 +505,7 @@ int piece_type_index(int piece) {
     }
 }
 
-int piece_square_offset(int piece, bool white_perspective) {
+constexpr int piece_square_offset_reference(int piece, bool white_perspective) {
     if (is_king_piece(piece)) {
         return kKingPlaneOffset;
     }
@@ -446,6 +517,29 @@ int piece_square_offset(int piece, bool white_perspective) {
 
     const bool friendly = white_perspective == is_white_piece(piece);
     return (ptype * 2 + (friendly ? 0 : 1)) * 64;
+}
+
+struct PieceSquareOffsetTable {
+    int offset[2][12];
+};
+
+constexpr PieceSquareOffsetTable make_piece_square_offset_table() {
+    PieceSquareOffsetTable table{};
+    for (int perspective = 0; perspective < 2; ++perspective) {
+        for (int piece = P; piece <= k; ++piece) {
+            table.offset[perspective][piece] = piece_square_offset_reference(piece, perspective == 0);
+        }
+    }
+    return table;
+}
+
+constexpr PieceSquareOffsetTable kPieceSquareOffsets = make_piece_square_offset_table();
+
+int piece_square_offset(int piece, bool white_perspective) {
+    if (static_cast<unsigned>(piece) > static_cast<unsigned>(k)) {
+        return -1;
+    }
+    return kPieceSquareOffsets.offset[white_perspective ? 0 : 1][piece];
 }
 
 int halfkav2_hm_index(int piece,
@@ -488,14 +582,9 @@ const LoadedNetwork* current_network() {
 void clear_state(thrawn::NnueState& state) {
     state.white_acc.fill(0);
     state.black_acc.fill(0);
-    state.piece_list.fill(0);
-    state.square_list.fill(0);
-    state.index_by_square.fill(-1);
-    state.white_acc_source_ply = kLocalAccumulatorSource;
-    state.black_acc_source_ply = kLocalAccumulatorSource;
-    state.piece_count = 0;
-    state.white_king_sq = -1;
-    state.black_king_sq = -1;
+    state.white_acc_ply = kUncomputedAccumulator;
+    state.black_acc_ply = kUncomputedAccumulator;
+    state.dirty_count = 0;
     state.valid = false;
 }
 
@@ -503,106 +592,12 @@ AccumulatorView local_accumulator_view(const thrawn::NnueState& state) {
     return {&state.white_acc, &state.black_acc};
 }
 
-int accumulator_source_for_child(const thrawn::NnueState& parent,
-                                 bool white_perspective,
-                                 int parent_ply) {
-    const int parent_source = white_perspective
-        ? parent.white_acc_source_ply
-        : parent.black_acc_source_ply;
-    return parent_source == kLocalAccumulatorSource ? parent_ply : parent_source;
+int8_t& accumulator_ply(thrawn::NnueState& state, bool white_perspective) {
+    return white_perspective ? state.white_acc_ply : state.black_acc_ply;
 }
 
-bool resolve_accumulator(const thrawn::Position* pos,
-                         int ply,
-                         bool white_perspective,
-                         const std::array<int16_t, kExpectedFtSize>*& accumulator) {
-    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
-        return false;
-    }
-
-    int source_ply = ply;
-    for (int hops = 0; hops <= MAX_DEPTH; ++hops) {
-        const thrawn::NnueState& state = pos->nnue_stack[static_cast<std::size_t>(source_ply)];
-        if (!state.valid) {
-            return false;
-        }
-
-        const int next_source = white_perspective
-            ? state.white_acc_source_ply
-            : state.black_acc_source_ply;
-        if (next_source == kLocalAccumulatorSource) {
-            accumulator = white_perspective ? &state.white_acc : &state.black_acc;
-            return true;
-        }
-        if (next_source < 0 || next_source > MAX_DEPTH || next_source == source_ply) {
-            return false;
-        }
-        source_ply = next_source;
-    }
-
-    return false;
-}
-
-bool accumulator_view_for_ply(const thrawn::Position* pos,
-                              int ply,
-                              AccumulatorView& view) {
-    return resolve_accumulator(pos, ply, true, view.white) &&
-           resolve_accumulator(pos, ply, false, view.black);
-}
-
-bool materialize_accumulator(thrawn::Position* pos, int ply, bool white_perspective) {
-    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
-        return false;
-    }
-
-    thrawn::NnueState& state = pos->nnue_stack[static_cast<std::size_t>(ply)];
-    int8_t& source = white_perspective ? state.white_acc_source_ply : state.black_acc_source_ply;
-    if (source == kLocalAccumulatorSource) {
-        return state.valid;
-    }
-
-    const std::array<int16_t, kExpectedFtSize>* source_acc = nullptr;
-    if (!resolve_accumulator(pos, ply, white_perspective, source_acc) || source_acc == nullptr) {
-        return false;
-    }
-
-    auto& target = white_perspective ? state.white_acc : state.black_acc;
-    if (source_acc != &target) {
-        target = *source_acc;
-    }
-    source = kLocalAccumulatorSource;
-    return true;
-}
-
-bool materialize_state_accumulators(thrawn::Position* pos, int ply) {
-    return materialize_accumulator(pos, ply, true) &&
-           materialize_accumulator(pos, ply, false);
-}
-
-void mark_accumulator_local(thrawn::NnueState& state, bool white_perspective) {
-    if (white_perspective) {
-        state.white_acc_source_ply = kLocalAccumulatorSource;
-    } else {
-        state.black_acc_source_ply = kLocalAccumulatorSource;
-    }
-}
-
-void copy_state_metadata_without_accumulators(thrawn::NnueState& child,
-                                              const thrawn::NnueState& parent,
-                                              int child_ply) {
-    child.piece_list = parent.piece_list;
-    child.square_list = parent.square_list;
-    child.index_by_square = parent.index_by_square;
-    child.piece_count = parent.piece_count;
-    child.white_king_sq = parent.white_king_sq;
-    child.black_king_sq = parent.black_king_sq;
-    child.valid = parent.valid;
-
-    const int parent_ply = child_ply - 1;
-    child.white_acc_source_ply = static_cast<int8_t>(
-        accumulator_source_for_child(parent, true, parent_ply));
-    child.black_acc_source_ply = static_cast<int8_t>(
-        accumulator_source_for_child(parent, false, parent_ply));
+std::array<int16_t, kExpectedFtSize>& accumulator_of(thrawn::NnueState& state, bool white_perspective) {
+    return white_perspective ? state.white_acc : state.black_acc;
 }
 
 enum class AccumulatorUpdateOp { Add, Subtract };
@@ -704,6 +699,54 @@ static inline void acc_add_sub_row_from_avx2(int16_t* dst, const int16_t* src,
             _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
                              _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i + 16))),
             _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
+    }
+}
+
+// Capture shape: dst = src + add - sub1 - sub2 (moving piece added at its target,
+// removed from its origin, captured piece removed).
+static inline void acc_add_sub_sub_row_from_avx2(int16_t* dst, const int16_t* src, const int16_t* add,
+                                                 const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+                                 _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+                                 _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i + 16))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i + 16))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
+    }
+}
+
+// Castling shape: dst = src + add1 + add2 - sub1 - sub2 (king and rook both move).
+static inline void acc_add2_sub2_row_from_avx2(int16_t* dst, const int16_t* src,
+                                               const int16_t* add1, const int16_t* add2,
+                                               const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(add1 + i))),
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(add2 + i))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(add1 + i + 16))),
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(add2 + i + 16))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i + 16))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i + 16)));
         _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
         _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
     }
@@ -834,6 +877,54 @@ static inline void acc_add_sub_row_from_avx512(int16_t* dst, const int16_t* src,
     }
 }
 
+// Capture shape: dst = src + add - sub1 - sub2 (moving piece added at its target,
+// removed from its origin, captured piece removed).
+static inline void acc_add_sub_sub_row_from_avx512(int16_t* dst, const int16_t* src, const int16_t* add,
+                                                   const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+                                 _mm512_load_si512(reinterpret_cast<const void*>(add + i))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+                                 _mm512_load_si512(reinterpret_cast<const void*>(add + i + 32))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i + 32))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
+// Castling shape: dst = src + add1 + add2 - sub1 - sub2 (king and rook both move).
+static inline void acc_add2_sub2_row_from_avx512(int16_t* dst, const int16_t* src,
+                                                 const int16_t* add1, const int16_t* add2,
+                                                 const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(
+                    _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+                                     _mm512_load_si512(reinterpret_cast<const void*>(add1 + i))),
+                    _mm512_load_si512(reinterpret_cast<const void*>(add2 + i))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(
+                    _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+                                     _mm512_load_si512(reinterpret_cast<const void*>(add1 + i + 32))),
+                    _mm512_load_si512(reinterpret_cast<const void*>(add2 + i + 32))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i + 32))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
 // Pairwise SqrCReLU (see the AVX2 twin for the math). ft_one <= 255 keeps
 // clamp(a)*clamp(b) < 2^16, so _mm512_mullo_epi16 yields the exact product and
 // _mm512_srl_epi16 (logical) renormalizes it into [0, act_one]. Since every result
@@ -918,6 +1009,40 @@ static inline void acc_sub_row_from_neon(int16_t* dst, const int16_t* src, const
     }
 }
 
+// Capture shape: dst = src + add - sub1 - sub2 (moving piece added at its target,
+// removed from its origin, captured piece removed).
+static inline void acc_add_sub_sub_row_from_neon(int16_t* dst, const int16_t* src, const int16_t* add,
+                                                 const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        const int16x8_t a0 = vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(add + i)),
+                                                 vld1q_s16(sub1 + i)),
+                                       vld1q_s16(sub2 + i));
+        const int16x8_t a1 = vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(add + i + 8)),
+                                                 vld1q_s16(sub1 + i + 8)),
+                                       vld1q_s16(sub2 + i + 8));
+        vst1q_s16(dst + i, a0);
+        vst1q_s16(dst + i + 8, a1);
+    }
+}
+
+// Castling shape: dst = src + add1 + add2 - sub1 - sub2 (king and rook both move).
+static inline void acc_add2_sub2_row_from_neon(int16_t* dst, const int16_t* src,
+                                               const int16_t* add1, const int16_t* add2,
+                                               const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        const int16x8_t a0 = vsubq_s16(
+            vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(add1 + i)), vld1q_s16(add2 + i)),
+                      vld1q_s16(sub1 + i)),
+            vld1q_s16(sub2 + i));
+        const int16x8_t a1 = vsubq_s16(
+            vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(add1 + i + 8)), vld1q_s16(add2 + i + 8)),
+                      vld1q_s16(sub1 + i + 8)),
+            vld1q_s16(sub2 + i + 8));
+        vst1q_s16(dst + i, a0);
+        vst1q_s16(dst + i + 8, a1);
+    }
+}
+
 // Pairwise SqrCReLU (see the AVX2 twin for the math). vmulq_s16 keeps the exact
 // low 16 bits (ft_one <= 255 so the product stays below 2^16); vshlq_u16 by a
 // negative count is a per-lane logical right shift, matching the scalar >>.
@@ -940,52 +1065,6 @@ void ft_pairwise_screlu_neon(const int16_t* acc, uint8_t* out, int half, int ft_
 }
 
 #endif
-
-bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
-                            const AlignedFtWeights& weights,
-                            int feature,
-                            AccumulatorUpdateOp op) {
-    if (feature < 0) {
-        return false;
-    }
-
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    if (offset + kExpectedFtSize > weights.size()) {
-        return false;
-    }
-
-    const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
-
-#if defined(USE_AVX512)
-    if (op == AccumulatorUpdateOp::Add) {
-        acc_add_row_avx512(acc, row);
-    } else {
-        acc_sub_row_avx512(acc, row);
-    }
-#elif defined(USE_AVX2)
-    if (op == AccumulatorUpdateOp::Add) {
-        acc_add_row_avx2(acc, row);
-    } else {
-        acc_sub_row_avx2(acc, row);
-    }
-#elif defined(USE_NEON)
-    if (op == AccumulatorUpdateOp::Add) {
-        acc_add_row_neon(acc, row);
-    } else {
-        acc_sub_row_neon(acc, row);
-    }
-#else
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const int32_t value = (op == AccumulatorUpdateOp::Add)
-            ? static_cast<int32_t>(acc[i]) + row[i]
-            : static_cast<int32_t>(acc[i]) - row[i];
-        acc[i] = static_cast<int16_t>(value);
-    }
-#endif
-
-    return true;
-}
 
 bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
                              const AlignedFtWeights& weights,
@@ -1051,7 +1130,15 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
         acc_add_sub_row_from_avx512(d, s, add_rows[0], sub_rows[0]);
         return true;
     }
-    // General case (castling / multi-piece batches): still a single fused pass —
+    if (add_count == 1 && sub_count == 2) {
+        acc_add_sub_sub_row_from_avx512(d, s, add_rows[0], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    if (add_count == 2 && sub_count == 2) {
+        acc_add2_sub2_row_from_avx512(d, s, add_rows[0], add_rows[1], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    // General case (multi-piece batches): still a single fused pass —
     // read src once, fold every add/sub row, write dst once.
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
         __m512i a = _mm512_load_si512(reinterpret_cast<const void*>(s + i));
@@ -1077,7 +1164,15 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
         acc_add_sub_row_from_avx2(d, s, add_rows[0], sub_rows[0]);
         return true;
     }
-    // General case (castling / multi-piece batches): still a single fused pass —
+    if (add_count == 1 && sub_count == 2) {
+        acc_add_sub_sub_row_from_avx2(d, s, add_rows[0], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    if (add_count == 2 && sub_count == 2) {
+        acc_add2_sub2_row_from_avx2(d, s, add_rows[0], add_rows[1], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    // General case (multi-piece batches): still a single fused pass —
     // read src once, fold every add/sub row, write dst once.
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
         __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(s + i));
@@ -1101,6 +1196,14 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
     }
     if (add_count == 1 && sub_count == 1) {
         acc_add_sub_row_from_neon(d, s, add_rows[0], sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 2) {
+        acc_add_sub_sub_row_from_neon(d, s, add_rows[0], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    if (add_count == 2 && sub_count == 2) {
+        acc_add2_sub2_row_from_neon(d, s, add_rows[0], add_rows[1], sub_rows[0], sub_rows[1]);
         return true;
     }
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
@@ -1250,156 +1353,231 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
     return true;
 }
 
-bool add_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
-                         const AlignedFtWeights& weights,
-                         int feature) {
-    return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Add);
+// dst = src + sum(add rows) - sum(sub rows), with an optional second copy of
+// the result written to dst2. The accumulator is processed in register tiles
+// (all rows folded into a tile before it is stored), so src/dst are read and
+// written exactly once however many rows are applied. Every op is wrapping
+// int16 arithmetic, so the result is bit-identical to applying the rows one
+// at a time in any order.
+void apply_feature_rows_tiled(const int16_t* src,
+                              int16_t* dst,
+                              int16_t* dst2,
+                              const int16_t* const* adds,
+                              int add_count,
+                              const int16_t* const* subs,
+                              int sub_count) {
+#if defined(USE_AVX512)
+    constexpr int kLanes = 32;
+    constexpr int kRegs = 8;
+    static_assert(kExpectedFtSize % (kLanes * kRegs) == 0, "FT size must fit AVX-512 refresh tiles");
+    for (int base = 0; base < static_cast<int>(kExpectedFtSize); base += kLanes * kRegs) {
+        __m512i r[kRegs];
+        for (int j = 0; j < kRegs; ++j) {
+            r[j] = _mm512_load_si512(reinterpret_cast<const void*>(src + base + j * kLanes));
+        }
+        for (int a = 0; a < add_count; ++a) {
+            const int16_t* row = adds[a] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm512_add_epi16(r[j], _mm512_load_si512(reinterpret_cast<const void*>(row + j * kLanes)));
+            }
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            const int16_t* row = subs[s] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm512_sub_epi16(r[j], _mm512_load_si512(reinterpret_cast<const void*>(row + j * kLanes)));
+            }
+        }
+        for (int j = 0; j < kRegs; ++j) {
+            _mm512_store_si512(reinterpret_cast<void*>(dst + base + j * kLanes), r[j]);
+        }
+        if (dst2 != nullptr) {
+            for (int j = 0; j < kRegs; ++j) {
+                _mm512_store_si512(reinterpret_cast<void*>(dst2 + base + j * kLanes), r[j]);
+            }
+        }
+    }
+#elif defined(USE_AVX2)
+    constexpr int kLanes = 16;
+    constexpr int kRegs = 8;
+    static_assert(kExpectedFtSize % (kLanes * kRegs) == 0, "FT size must fit AVX2 refresh tiles");
+    for (int base = 0; base < static_cast<int>(kExpectedFtSize); base += kLanes * kRegs) {
+        __m256i r[kRegs];
+        for (int j = 0; j < kRegs; ++j) {
+            r[j] = _mm256_load_si256(reinterpret_cast<const __m256i*>(src + base + j * kLanes));
+        }
+        for (int a = 0; a < add_count; ++a) {
+            const int16_t* row = adds[a] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm256_add_epi16(r[j], _mm256_load_si256(reinterpret_cast<const __m256i*>(row + j * kLanes)));
+            }
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            const int16_t* row = subs[s] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm256_sub_epi16(r[j], _mm256_load_si256(reinterpret_cast<const __m256i*>(row + j * kLanes)));
+            }
+        }
+        for (int j = 0; j < kRegs; ++j) {
+            _mm256_store_si256(reinterpret_cast<__m256i*>(dst + base + j * kLanes), r[j]);
+        }
+        if (dst2 != nullptr) {
+            for (int j = 0; j < kRegs; ++j) {
+                _mm256_store_si256(reinterpret_cast<__m256i*>(dst2 + base + j * kLanes), r[j]);
+            }
+        }
+    }
+#elif defined(USE_NEON)
+    constexpr int kLanes = 8;
+    constexpr int kRegs = 16;
+    static_assert(kExpectedFtSize % (kLanes * kRegs) == 0, "FT size must fit NEON refresh tiles");
+    for (int base = 0; base < static_cast<int>(kExpectedFtSize); base += kLanes * kRegs) {
+        int16x8_t r[kRegs];
+        for (int j = 0; j < kRegs; ++j) {
+            r[j] = vld1q_s16(src + base + j * kLanes);
+        }
+        for (int a = 0; a < add_count; ++a) {
+            const int16_t* row = adds[a] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = vaddq_s16(r[j], vld1q_s16(row + j * kLanes));
+            }
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            const int16_t* row = subs[s] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = vsubq_s16(r[j], vld1q_s16(row + j * kLanes));
+            }
+        }
+        for (int j = 0; j < kRegs; ++j) {
+            vst1q_s16(dst + base + j * kLanes, r[j]);
+        }
+        if (dst2 != nullptr) {
+            for (int j = 0; j < kRegs; ++j) {
+                vst1q_s16(dst2 + base + j * kLanes, r[j]);
+            }
+        }
+    }
+#else
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
+        int32_t value = src[i];
+        for (int a = 0; a < add_count; ++a) {
+            value += adds[a][i];
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            value -= subs[s][i];
+        }
+        dst[i] = static_cast<int16_t>(value);
+        if (dst2 != nullptr) {
+            dst2[i] = static_cast<int16_t>(value);
+        }
+    }
+#endif
 }
 
-
-bool track_piece(thrawn::NnueState& state, int piece, int square) {
-    if (piece < P || piece > k ||
-        square < 0 || square >= BOARD_SIZE ||
-        state.piece_count >= thrawn::NNUE_MAX_PIECES) {
+// Refresh one perspective through the position's refresh cache: take the cached
+// accumulator for this (perspective, king square), apply only the features that
+// differ between its stored bitboards and the live board, store the result back
+// into the cache and into `state`. Exact (bit-identical to a from-scratch
+// refresh) because the cached accumulator is always ft_bias plus exactly the
+// rows of the pieces in its stored bitboards.
+bool refresh_perspective_accumulator_cached(thrawn::Position* pos,
+                                            thrawn::NnueState& state,
+                                            const LoadedNetwork& network,
+                                            bool white_perspective) {
+    const uint64_t king_bb = pos->piece_bitboards[white_perspective ? K : k];
+    if (king_bb == 0) {
         return false;
     }
-    if (state.index_by_square[square] != -1) {
-        return false;
+    const int our_king_square = get_lsb_index(king_bb);
+
+    thrawn::NnueRefreshEntry& entry =
+        pos->nnue_stack.refresh_cache().entries[white_perspective ? 1 : 0][our_king_square];
+    const uint32_t generation = g_network_generation.load(std::memory_order_relaxed);
+    if (entry.generation != generation) {
+        entry.acc = network.ft_bias;
+        entry.bitboards.fill(0ULL);
+        entry.generation = generation;
     }
 
-    if (piece == K && state.white_king_sq != -1) {
-        return false;
-    }
-    if (piece == k && state.black_king_sq != -1) {
-        return false;
-    }
+    // Pieces sit on distinct squares, so each side of the diff has at most 64 bits.
+    const int16_t* adds[BOARD_SIZE];
+    const int16_t* subs[BOARD_SIZE];
+    int add_count = 0;
+    int sub_count = 0;
+    const int16_t* weights = network.ft_weight.data();
 
-    const int index = state.piece_count;
-    state.piece_list[index] = static_cast<uint8_t>(piece);
-    state.square_list[index] = static_cast<uint8_t>(square);
-    state.index_by_square[square] = static_cast<int8_t>(index);
-    state.piece_count = static_cast<uint8_t>(state.piece_count + 1);
-
-    if (piece == K) {
-        state.white_king_sq = static_cast<int8_t>(square);
-    } else if (piece == k) {
-        state.black_king_sq = static_cast<int8_t>(square);
-    }
-
-    return true;
-}
-
-bool untrack_piece(thrawn::NnueState& state, int piece, int square) {
-    if (square < 0 || square >= BOARD_SIZE) {
-        return false;
-    }
-
-    const int index = state.index_by_square[square];
-    if (index < 0 || index >= static_cast<int>(state.piece_count) || state.piece_list[index] != piece) {
-        return false;
-    }
-
-    if (piece == K) {
-        state.white_king_sq = -1;
-    } else if (piece == k) {
-        state.black_king_sq = -1;
-    }
-
-    const int last_index = static_cast<int>(state.piece_count) - 1;
-    state.index_by_square[square] = -1;
-
-    if (index != last_index) {
-        const uint8_t moved_piece = state.piece_list[last_index];
-        const uint8_t moved_square = state.square_list[last_index];
-        state.piece_list[index] = moved_piece;
-        state.square_list[index] = moved_square;
-        state.index_by_square[moved_square] = static_cast<int8_t>(index);
-    }
-
-    state.piece_list[last_index] = 0;
-    state.square_list[last_index] = 0;
-    state.piece_count = static_cast<uint8_t>(state.piece_count - 1);
-    return true;
-}
-
-bool refresh_perspective_accumulator(thrawn::NnueState& state,
-                                     const LoadedNetwork& network,
-                                     bool white_perspective) {
-    const int our_king_square = white_perspective ? state.white_king_sq : state.black_king_sq;
-    if (our_king_square < 0 || our_king_square >= BOARD_SIZE) {
-        return false;
-    }
-
-    auto& acc = white_perspective ? state.white_acc : state.black_acc;
-    mark_accumulator_local(state, white_perspective);
-    acc = network.ft_bias;
-
-    for (int i = 0; i < static_cast<int>(state.piece_count); ++i) {
-        const int piece = state.piece_list[i];
-        const int square = state.square_list[i];
-        const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
-        if (feature < 0 || !add_accumulator_row(acc, network.ft_weight, feature)) {
-            return false;
+    for (int piece = P; piece <= k; ++piece) {
+        const uint64_t current = pos->piece_bitboards[piece];
+        const uint64_t cached = entry.bitboards[piece];
+        uint64_t added = current & ~cached;
+        uint64_t removed = cached & ~current;
+        while (added) {
+            const int square = pop_lsb(added);
+            const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
+            if (feature < 0) {
+                return false;
+            }
+            adds[add_count++] = weights + static_cast<std::size_t>(feature) * kExpectedFtSize;
+        }
+        while (removed) {
+            const int square = pop_lsb(removed);
+            const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
+            if (feature < 0) {
+                return false;
+            }
+            subs[sub_count++] = weights + static_cast<std::size_t>(feature) * kExpectedFtSize;
         }
     }
 
+    auto& acc = white_perspective ? state.white_acc : state.black_acc;
+    apply_feature_rows_tiled(entry.acc.data(), entry.acc.data(), acc.data(),
+                             adds, add_count, subs, sub_count);
+    for (int piece = P; piece <= k; ++piece) {
+        entry.bitboards[piece] = pos->piece_bitboards[piece];
+    }
     return true;
 }
 
-
-bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
-                                                thrawn::NnueState& state,
-                                                const LoadedNetwork& network,
-                                                bool white_perspective) {
-    if (pos == nullptr) {
+// Full refresh of one perspective from the board: ft_bias plus the row of every
+// piece, folded in one register-tiled pass. Used where no refresh cache applies
+// (root builds, verification rebuilds).
+bool refresh_perspective_accumulator_full(const thrawn::Position* pos,
+                                          thrawn::NnueState& state,
+                                          const LoadedNetwork& network,
+                                          bool white_perspective) {
+    const uint64_t king_bb = pos->piece_bitboards[white_perspective ? K : k];
+    if (king_bb == 0) {
         return false;
     }
+    const int our_king_square = get_lsb_index(king_bb);
 
-    auto& acc = white_perspective ? state.white_acc : state.black_acc;
-    mark_accumulator_local(state, white_perspective);
-    acc = network.ft_bias;
-
-    const int our_king_square = white_perspective
-        ? get_lsb_index(pos->piece_bitboards[K])
-        : get_lsb_index(pos->piece_bitboards[k]);
-    if (our_king_square < 0 || our_king_square >= BOARD_SIZE) {
-        return false;
-    }
-
-    if (white_perspective) {
-        state.white_king_sq = static_cast<int8_t>(our_king_square);
-    } else {
-        state.black_king_sq = static_cast<int8_t>(our_king_square);
-    }
-
+    const int16_t* adds[BOARD_SIZE];
+    int add_count = 0;
+    const int16_t* weights = network.ft_weight.data();
     for (int piece = P; piece <= k; ++piece) {
         uint64_t bitboard = pos->piece_bitboards[piece];
         while (bitboard) {
             const int square = pop_lsb(bitboard);
             const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
-            if (feature < 0 || !add_accumulator_row(acc, network.ft_weight, feature)) {
+            if (feature < 0 || add_count >= BOARD_SIZE) {
                 return false;
             }
+            adds[add_count++] = weights + static_cast<std::size_t>(feature) * kExpectedFtSize;
         }
     }
 
+    auto& acc = white_perspective ? state.white_acc : state.black_acc;
+    apply_feature_rows_tiled(network.ft_bias.data(), acc.data(), nullptr,
+                             adds, add_count, nullptr, 0);
     return true;
 }
 
-
-
-bool collect_feature_update_for_perspective(const thrawn::NnueState& state,
-                                            const NnuePieceUpdate& update,
+bool collect_feature_update_for_perspective(int our_king_square,
+                                            const thrawn::NnueDirtyPiece& update,
                                             bool white_perspective,
                                             AccumulatorFeatureUpdate* feature_updates,
                                             int& feature_update_count) {
     if (!should_patch_piece_for_perspective(update.piece, white_perspective)) {
         return true;
-    }
-
-    const int our_king_square = white_perspective ? state.white_king_sq : state.black_king_sq;
-    if (our_king_square < 0 || our_king_square >= BOARD_SIZE) {
-        return is_king_piece(update.piece);
     }
 
     const int feature = halfkav2_hm_index(update.piece,
@@ -1420,102 +1598,97 @@ bool collect_feature_update_for_perspective(const thrawn::NnueState& state,
     return true;
 }
 
-// Resolve the source accumulator for this perspective (the nearest materialized
-// ancestor, or the local one) and write state's accumulator = source ± feature
-// rows in a single fused pass, then mark it local. This replaces the previous
-// two-step materialize (2 KB copy) + in-place patch with one read/write pass.
-bool materialize_and_apply_rows(thrawn::Position* pos,
-                                int ply,
-                                thrawn::NnueState& state,
-                                bool white_perspective,
-                                const AlignedFtWeights& weights,
-                                const AccumulatorFeatureUpdate* updates,
-                                int update_count) {
-    auto& dst = white_perspective ? state.white_acc : state.black_acc;
-    int8_t& source = white_perspective ? state.white_acc_source_ply
-                                       : state.black_acc_source_ply;
+// Materialize (if needed) and return this perspective's accumulator for `ply`,
+// which must be the ply the board is currently at (a refresh reads the live
+// board). Walk back to the nearest ply whose accumulator is computed, then
+// replay each later ply's dirty pieces forward in fused src->dst passes, so
+// every intermediate ply becomes computed too (later siblings reuse them).
+// If the walk crosses a move of this perspective's own king, the chain cannot
+// be replayed incrementally; the accumulator is instead refreshed at `ply`
+// straight from the board via the refresh cache. Returns nullptr if the state
+// is invalid or an update cannot be applied.
+const std::array<int16_t, kExpectedFtSize>* ensure_accumulator(thrawn::Position* pos,
+                                                               int ply,
+                                                               bool white_perspective,
+                                                               const LoadedNetwork& network) {
+    thrawn::NnueStack& stack = pos->nnue_stack;
+    thrawn::NnueState& state = stack[static_cast<std::size_t>(ply)];
+    if (!state.valid) {
+        return nullptr;
+    }
 
-    const std::array<int16_t, kExpectedFtSize>* src_acc = &dst;
-    if (source != kLocalAccumulatorSource) {
-        if (!resolve_accumulator(pos, ply, white_perspective, src_acc) ||
-            src_acc == nullptr) {
-            return false;
+    int8_t& state_acc_ply = accumulator_ply(state, white_perspective);
+    if (state_acc_ply != kUncomputedAccumulator) {
+        return &accumulator_of(stack[static_cast<std::size_t>(state_acc_ply)], white_perspective);
+    }
+
+    const int own_king = white_perspective ? K : k;
+    int base = ply;
+    for (;;) {
+        thrawn::NnueState& walk = stack[static_cast<std::size_t>(base)];
+        if (accumulator_ply(walk, white_perspective) != kUncomputedAccumulator) {
+            break;
         }
+        for (int i = 0; i < walk.dirty_count; ++i) {
+            if (walk.dirty[i].piece == own_king) {
+                if (!refresh_perspective_accumulator_cached(pos, state, network, white_perspective)) {
+                    return nullptr;
+                }
+                state_acc_ply = static_cast<int8_t>(ply);
+                return &accumulator_of(state, white_perspective);
+            }
+        }
+        if (base == 0) {
+            return nullptr;
+        }
+        --base;
     }
 
-    if (!update_accumulator_rows_from(dst, *src_acc, weights, updates, update_count)) {
-        return false;
+    // No own-king move in (base, ply], so the king square is the live one.
+    const int our_king_square = get_lsb_index(pos->piece_bitboards[own_king]);
+    if (our_king_square < 0) {
+        return nullptr;
     }
 
-    source = kLocalAccumulatorSource;
-    return true;
+    for (int j = base + 1; j <= ply; ++j) {
+        thrawn::NnueState& prev = stack[static_cast<std::size_t>(j - 1)];
+        thrawn::NnueState& cur = stack[static_cast<std::size_t>(j)];
+        const int source_ply = accumulator_ply(prev, white_perspective);
+
+        AccumulatorFeatureUpdate updates[kMaxBatchedPieceUpdates];
+        int update_count = 0;
+        for (int i = 0; i < cur.dirty_count; ++i) {
+            if (!collect_feature_update_for_perspective(our_king_square, cur.dirty[i], white_perspective,
+                                                        updates, update_count)) {
+                return nullptr;
+            }
+        }
+
+        if (update_count == 0) {
+            // Nothing changed for this perspective (null move): share the source.
+            accumulator_ply(cur, white_perspective) = static_cast<int8_t>(source_ply);
+            continue;
+        }
+
+        if (!update_accumulator_rows_from(accumulator_of(cur, white_perspective),
+                                          accumulator_of(stack[static_cast<std::size_t>(source_ply)],
+                                                         white_perspective),
+                                          network.ft_weight, updates, update_count)) {
+            return nullptr;
+        }
+        accumulator_ply(cur, white_perspective) = static_cast<int8_t>(j);
+    }
+
+    return &accumulator_of(stack[static_cast<std::size_t>(state_acc_ply)], white_perspective);
 }
 
-bool apply_piece_updates_to_state(thrawn::Position* pos,
-                                  int ply,
-                                  thrawn::NnueState& state,
-                                  const LoadedNetwork& network,
-                                  const NnuePieceUpdate* updates,
-                                  int update_count) {
-    if (updates == nullptr || update_count < 0 || update_count > kMaxBatchedPieceUpdates) {
-        return false;
-    }
-
-    bool refresh_white = false;
-    bool refresh_black = false;
-    for (int i = 0; i < update_count; ++i) {
-        if (updates[i].piece == K) {
-            refresh_white = true;
-        } else if (updates[i].piece == k) {
-            refresh_black = true;
-        }
-    }
-
-    AccumulatorFeatureUpdate white_updates[kMaxBatchedPieceUpdates];
-    AccumulatorFeatureUpdate black_updates[kMaxBatchedPieceUpdates];
-    int white_update_count = 0;
-    int black_update_count = 0;
-    for (int i = 0; i < update_count; ++i) {
-        if (!refresh_white &&
-            !collect_feature_update_for_perspective(state, updates[i], true, white_updates, white_update_count)) {
-            return false;
-        }
-        if (!refresh_black &&
-            !collect_feature_update_for_perspective(state, updates[i], false, black_updates, black_update_count)) {
-            return false;
-        }
-    }
-
-    if (white_update_count > 0) {
-        if (!materialize_and_apply_rows(pos, ply, state, true, network.ft_weight,
-                                        white_updates, white_update_count)) {
-            return false;
-        }
-    }
-    if (black_update_count > 0) {
-        if (!materialize_and_apply_rows(pos, ply, state, false, network.ft_weight,
-                                        black_updates, black_update_count)) {
-            return false;
-        }
-    }
-
-    for (int i = 0; i < update_count; ++i) {
-        const bool ok = updates[i].add
-            ? track_piece(state, updates[i].piece, updates[i].square)
-            : untrack_piece(state, updates[i].piece, updates[i].square);
-        if (!ok) {
-            return false;
-        }
-    }
-
-    if (refresh_white && !refresh_perspective_accumulator_from_board(pos, state, network, true)) {
-        return false;
-    }
-    if (refresh_black && !refresh_perspective_accumulator_from_board(pos, state, network, false)) {
-        return false;
-    }
-
-    return true;
+bool ensure_accumulators(thrawn::Position* pos,
+                         int ply,
+                         const LoadedNetwork& network,
+                         AccumulatorView& view) {
+    view.white = ensure_accumulator(pos, ply, true, network);
+    view.black = ensure_accumulator(pos, ply, false, network);
+    return view.valid();
 }
 
 bool build_state_from_board(const thrawn::Position* pos,
@@ -1523,28 +1696,34 @@ bool build_state_from_board(const thrawn::Position* pos,
                             thrawn::NnueState& out_state) {
     clear_state(out_state);
 
+    // Sanity-check the board (at most 32 pieces on distinct squares, exactly one
+    // king per side) before building; an invalid state falls back to eval 0.
+    uint64_t occupied = 0ULL;
+    int piece_total = 0;
     for (int piece = P; piece <= k; ++piece) {
-        uint64_t bitboard = pos->piece_bitboards[piece];
-        while (bitboard) {
-            const int square = pop_lsb(bitboard);
-            if (!track_piece(out_state, piece, square)) {
-                clear_state(out_state);
-                return false;
-            }
+        const uint64_t bitboard = pos->piece_bitboards[piece];
+        if ((occupied & bitboard) != 0ULL) {
+            return false;
         }
+        occupied |= bitboard;
+        piece_total += count_bits(bitboard);
+    }
+    if (piece_total > 32 ||
+        count_bits(pos->piece_bitboards[K]) != 1 ||
+        count_bits(pos->piece_bitboards[k]) != 1) {
+        return false;
     }
 
-    if (out_state.white_king_sq < 0 || out_state.black_king_sq < 0) {
+    if (!refresh_perspective_accumulator_full(pos, out_state, network, true) ||
+        !refresh_perspective_accumulator_full(pos, out_state, network, false)) {
         clear_state(out_state);
         return false;
     }
 
-    if (!refresh_perspective_accumulator(out_state, network, true) ||
-        !refresh_perspective_accumulator(out_state, network, false)) {
-        clear_state(out_state);
-        return false;
-    }
-
+    // Built states are the root (ply 0) or standalone temporaries read through
+    // local_accumulator_view, so the accumulators live in their own buffers.
+    out_state.white_acc_ply = 0;
+    out_state.black_acc_ply = 0;
     out_state.valid = true;
     return true;
 }
@@ -1553,12 +1732,13 @@ EvaluationState state_for_evaluation(const thrawn::Position* pos,
                                      const LoadedNetwork& network,
                                      thrawn::NnueState& refreshed_state) {
     if (pos->ply >= 0 && pos->ply <= MAX_DEPTH) {
+        // Materializing lazy accumulators only fills in values already fixed by
+        // the board and move history, so it is logically const.
+        thrawn::Position* mutable_pos = const_cast<thrawn::Position*>(pos);
         const thrawn::NnueState& live_state = pos->nnue_stack[pos->ply];
-        if (live_state.valid) {
-            EvaluationState evaluation{&live_state, {}};
-            if (accumulator_view_for_ply(pos, pos->ply, evaluation.accumulators)) {
-                return evaluation;
-            }
+        EvaluationState evaluation{&live_state, {}};
+        if (live_state.valid && ensure_accumulators(mutable_pos, pos->ply, network, evaluation.accumulators)) {
+            return evaluation;
         }
     }
 
@@ -1829,16 +2009,30 @@ int32_t dot_u8_i8_neon(const uint8_t* x_u8, const int8_t* w, int count) {
 #endif
 }
 
-void dot_u8_i8_x4_neon(const uint8_t* x_u8,
-                       const int8_t* w0,
-                       const int8_t* w1,
-                       const int8_t* w2,
-                       const int8_t* w3,
-                       int count,
-                       int32_t& s0,
-                       int32_t& s1,
-                       int32_t& s2,
-                       int32_t& s3) {
+// Accumulates one 16-byte slice of a dot product into `acc`. Both operands are
+// read as int8, matching dot_u8_i8_neon.
+static inline int32x4_t dot_acc_s8_neon(int32x4_t acc, int8x16_t x, int8x16_t w) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, x, w);
+#else
+    const int16x8_t lo = vmull_s8(vget_low_s8(x), vget_low_s8(w));
+    const int16x8_t hi = vmull_s8(vget_high_s8(x), vget_high_s8(w));
+    return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
+#endif
+}
+
+// Folds four per-row partial-sum vectors into {sum(r0), sum(r1), sum(r2), sum(r3)}.
+static inline int32x4_t reduce_x4_neon(int32x4_t r0, int32x4_t r1, int32x4_t r2, int32x4_t r3) {
+    return vpaddq_s32(vpaddq_s32(r0, r1), vpaddq_s32(r2, r3));
+}
+
+// Four dot products of x against w0..w3, returned as one vector of the four sums.
+int32x4_t dot_u8_i8_x4_neon(const uint8_t* x_u8,
+                            const int8_t* w0,
+                            const int8_t* w1,
+                            const int8_t* w2,
+                            const int8_t* w3,
+                            int count) {
     const int8_t* x = reinterpret_cast<const int8_t*>(x_u8);
 
     int32x4_t a00 = vdupq_n_s32(0);
@@ -1850,43 +2044,22 @@ void dot_u8_i8_x4_neon(const uint8_t* x_u8,
     int32x4_t a30 = vdupq_n_s32(0);
     int32x4_t a31 = vdupq_n_s32(0);
 
-#if !defined(__ARM_FEATURE_DOTPROD)
-    auto accumulate = [](int32x4_t acc, int8x16_t xv, int8x16_t wv) {
-        const int16x8_t lo = vmull_s8(vget_low_s8(xv), vget_low_s8(wv));
-        const int16x8_t hi = vmull_s8(vget_high_s8(xv), vget_high_s8(wv));
-        return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
-    };
-#endif
-
     int i = 0;
     for (; i + 31 < count; i += 32) {
         const int8x16_t x0 = vld1q_s8(x + i);
         const int8x16_t x1 = vld1q_s8(x + i + 16);
-#if defined(__ARM_FEATURE_DOTPROD)
-        a00 = vdotq_s32(a00, x0, vld1q_s8(w0 + i));
-        a01 = vdotq_s32(a01, x1, vld1q_s8(w0 + i + 16));
-        a10 = vdotq_s32(a10, x0, vld1q_s8(w1 + i));
-        a11 = vdotq_s32(a11, x1, vld1q_s8(w1 + i + 16));
-        a20 = vdotq_s32(a20, x0, vld1q_s8(w2 + i));
-        a21 = vdotq_s32(a21, x1, vld1q_s8(w2 + i + 16));
-        a30 = vdotq_s32(a30, x0, vld1q_s8(w3 + i));
-        a31 = vdotq_s32(a31, x1, vld1q_s8(w3 + i + 16));
-#else
-        a00 = accumulate(a00, x0, vld1q_s8(w0 + i));
-        a01 = accumulate(a01, x1, vld1q_s8(w0 + i + 16));
-        a10 = accumulate(a10, x0, vld1q_s8(w1 + i));
-        a11 = accumulate(a11, x1, vld1q_s8(w1 + i + 16));
-        a20 = accumulate(a20, x0, vld1q_s8(w2 + i));
-        a21 = accumulate(a21, x1, vld1q_s8(w2 + i + 16));
-        a30 = accumulate(a30, x0, vld1q_s8(w3 + i));
-        a31 = accumulate(a31, x1, vld1q_s8(w3 + i + 16));
-#endif
+        a00 = dot_acc_s8_neon(a00, x0, vld1q_s8(w0 + i));
+        a01 = dot_acc_s8_neon(a01, x1, vld1q_s8(w0 + i + 16));
+        a10 = dot_acc_s8_neon(a10, x0, vld1q_s8(w1 + i));
+        a11 = dot_acc_s8_neon(a11, x1, vld1q_s8(w1 + i + 16));
+        a20 = dot_acc_s8_neon(a20, x0, vld1q_s8(w2 + i));
+        a21 = dot_acc_s8_neon(a21, x1, vld1q_s8(w2 + i + 16));
+        a30 = dot_acc_s8_neon(a30, x0, vld1q_s8(w3 + i));
+        a31 = dot_acc_s8_neon(a31, x1, vld1q_s8(w3 + i + 16));
     }
 
-    s0 = vaddvq_s32(vaddq_s32(a00, a01));
-    s1 = vaddvq_s32(vaddq_s32(a10, a11));
-    s2 = vaddvq_s32(vaddq_s32(a20, a21));
-    s3 = vaddvq_s32(vaddq_s32(a30, a31));
+    return reduce_x4_neon(vaddq_s32(a00, a01), vaddq_s32(a10, a11),
+                          vaddq_s32(a20, a21), vaddq_s32(a30, a31));
 }
 #endif
 
@@ -1996,7 +2169,11 @@ void dot_u8_i8_x4(const uint8_t* x,
     }
 #elif defined(USE_NEON)
     if (count % 16 == 0) {
-        dot_u8_i8_x4_neon(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        const int32x4_t sums = dot_u8_i8_x4_neon(x, w0, w1, w2, w3, count);
+        s0 = vgetq_lane_s32(sums, 0);
+        s1 = vgetq_lane_s32(sums, 1);
+        s2 = vgetq_lane_s32(sums, 2);
+        s3 = vgetq_lane_s32(sums, 3);
         return;
     }
 #endif
@@ -2014,13 +2191,9 @@ uint8_t crelu_to_u8(int64_t value, int32_t scale) {
     return static_cast<uint8_t>(value);
 }
 
-uint8_t screlu_to_u8(uint8_t crelu, int32_t scale) {
-    return static_cast<uint8_t>(div_round_by_scale(static_cast<int64_t>(crelu) * crelu, scale));
-}
-
-IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
-                                                        const LoadedNetwork& network,
-                                                        int colour_to_move) {
+// Portable forward pass, also the reference the SIMD forward pass must match.
+[[maybe_unused]] IntEvaluationResult evaluate_accumulators_int_quantized_generic(
+    const AccumulatorView& accumulators, const LoadedNetwork& network, int colour_to_move) {
     alignas(64) std::array<uint8_t, kFc0InputSize> act;
     alignas(64) std::array<int32_t, kExpectedFc0OutputSize> fc0;
     alignas(64) std::array<uint8_t, kFc1InputPaddedSize> a0;
@@ -2050,18 +2223,18 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
                      d0, d1, d2, d3);
 
         fc0[j] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j]) +
-                                      div_round_by_scale(d0, network.act_one));
+                                      network.div_act_one.div_round(d0));
         fc0[j + 1] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 1]) +
-                                          div_round_by_scale(d1, network.act_one));
+                                          network.div_act_one.div_round(d1));
         fc0[j + 2] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 2]) +
-                                          div_round_by_scale(d2, network.act_one));
+                                          network.div_act_one.div_round(d2));
         fc0[j + 3] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 3]) +
-                                          div_round_by_scale(d3, network.act_one));
+                                          network.div_act_one.div_round(d3));
     }
 
     for (int i = 0; i < static_cast<int>(kExpectedHiddenSize); ++i) {
         const uint8_t crelu = crelu_to_u8(fc0[i], network.qfc0);
-        a0[i] = screlu_to_u8(crelu, network.qfc0);
+        a0[i] = network.screlu_lut[crelu];
         a0[static_cast<int>(kExpectedHiddenSize) + i] = crelu;
     }
     if constexpr (kFc1InputPaddedSize > static_cast<int>(kExpectedFc1InputSize)) {
@@ -2082,21 +2255,537 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
                      d0, d1, d2, d3);
 
         a1[j] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j]) +
-                            div_round_by_scale(d0, network.qfc0), network.qfc1);
+                            network.div_qfc0.div_round(d0), network.qfc1);
         a1[j + 1] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j + 1]) +
-                                div_round_by_scale(d1, network.qfc0), network.qfc1);
+                                network.div_qfc0.div_round(d1), network.qfc1);
         a1[j + 2] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j + 2]) +
-                                div_round_by_scale(d2, network.qfc0), network.qfc1);
+                                network.div_qfc0.div_round(d2), network.qfc1);
         a1[j + 3] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j + 3]) +
-                                div_round_by_scale(d3, network.qfc0), network.qfc1);
+                                network.div_qfc0.div_round(d3), network.qfc1);
     }
 
     const int32_t fc2_dot = dot_u8_i8(a1.data(), network.fc2_weight.data(), kExpectedFc1OutputSize);
     return {
         static_cast<int32_t>(static_cast<int64_t>(network.fc2_bias) +
-                             div_round_by_scale(fc2_dot, network.qfc1)),
+                             network.div_qfc1.div_round(fc2_dot)),
         fc0[static_cast<int>(kExpectedHiddenSize)]
     };
+}
+
+#if defined(USE_NEON)
+// Every dot product the NEON forward pass divides reads both operands as int8,
+// so |sum| <= inputs * 128 * 128. Adding the rounding half (< 128) must stay
+// below 2^31 = 2^RoundingDivider::kMagicBits, where the multiply-shift quotient
+// is exact and RoundingDivider::div_round never takes its division fallback.
+static_assert(static_cast<int64_t>(kFc0InputSize) * 128 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc0 dot products exceed the exact multiply-shift range");
+static_assert(static_cast<int64_t>(kFc1InputPaddedSize) * 128 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc1 dot products exceed the exact multiply-shift range");
+// The squared CReLU (<= 255 * 255) plus its rounding half stays in the same range.
+static_assert(255 * 255 + 128 < (int64_t{1} << RoundingDivider::kMagicBits),
+              "squared activation exceeds the exact multiply-shift range");
+
+// Lane-wise RoundingDivider::div_round for |v| + half < 2^31 (see the bounds
+// above): q = ((|v| + half) * magic) >> shift with a full 64-bit product, then
+// the sign of v reapplied, so each lane equals the scalar result.
+struct RoundingDividerNeon {
+    uint32x4_t magic;
+    int64x2_t neg_shift;
+    uint32x4_t half;
+
+    explicit RoundingDividerNeon(const RoundingDivider& divider)
+        : magic(vdupq_n_u32(static_cast<uint32_t>(divider.magic))),
+          neg_shift(vdupq_n_s64(-static_cast<int64_t>(divider.shift))),
+          half(vdupq_n_u32(divider.half)) {}
+
+    int32x4_t div_round(int32x4_t v) const {
+        const uint32x4_t n = vaddq_u32(vreinterpretq_u32_s32(vabsq_s32(v)), half);
+        const uint64x2_t lo = vshlq_u64(vmull_u32(vget_low_u32(n), vget_low_u32(magic)), neg_shift);
+        const uint64x2_t hi = vshlq_u64(vmull_high_u32(n, magic), neg_shift);
+        const int32x4_t q = vreinterpretq_s32_u32(vcombine_u32(vmovn_u64(lo), vmovn_u64(hi)));
+        const int32x4_t sign = vshrq_n_s32(v, 31);
+        return vsubq_s32(veorq_s32(q, sign), sign);
+    }
+};
+
+// Narrows four int32x4 lanes already clamped to [0, 255] into one uint8x16.
+static inline uint8x16_t narrow_u8_neon(int32x4_t v0, int32x4_t v1, int32x4_t v2, int32x4_t v3) {
+    const uint16x8_t lo = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(v0)),
+                                       vmovn_u32(vreinterpretq_u32_s32(v1)));
+    const uint16x8_t hi = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(v2)),
+                                       vmovn_u32(vreinterpretq_u32_s32(v3)));
+    return vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
+}
+
+// fc1 input layout as byte indices into the 64-byte table [screlu(fc0) | crelu(fc0)]
+// (32 lanes each): fc1 input i < H reads screlu lane i, H <= i < 2H reads crelu
+// lane i - H, and the padding reads 0xFF, which vqtbl4q_u8 turns into 0.
+struct Fc1InputGatherIndices {
+    alignas(16) uint8_t index[kFc1InputPaddedSize];
+};
+
+constexpr Fc1InputGatherIndices make_fc1_input_gather_indices() {
+    Fc1InputGatherIndices result{};
+    constexpr int hidden = static_cast<int>(kExpectedHiddenSize);
+    for (int i = 0; i < kFc1InputPaddedSize; ++i) {
+        result.index[i] = i < hidden       ? static_cast<uint8_t>(i)
+                        : i < 2 * hidden   ? static_cast<uint8_t>(32 + i - hidden)
+                                           : uint8_t{0xFF};
+    }
+    return result;
+}
+
+constexpr Fc1InputGatherIndices kFc1InputGather = make_fc1_input_gather_indices();
+
+#if defined(__ARM_FEATURE_DOTPROD)
+constexpr int kFc0InputChunks = kFc0InputSize / 4;
+static_assert(kFc0InputChunks % 16 == 0, "fc0 chunk scan reads 16 chunks per step");
+static_assert(kFc0InputChunks <= 65536, "fc0 chunk indices must fit uint16");
+
+// For every 8-bit mask, the positions of its set bits in ascending order, padded
+// with 0, and the number of set bits.
+struct NonzeroChunkTable {
+    alignas(16) uint16_t index[256][8];
+    uint8_t count[256];
+};
+
+constexpr NonzeroChunkTable make_nonzero_chunk_table() {
+    NonzeroChunkTable result{};
+    for (int mask = 0; mask < 256; ++mask) {
+        int n = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+            if (mask & (1 << bit)) {
+                result.index[mask][n++] = static_cast<uint16_t>(bit);
+            }
+        }
+        result.count[mask] = static_cast<uint8_t>(n);
+    }
+    return result;
+}
+
+constexpr NonzeroChunkTable kNonzeroChunkTable = make_nonzero_chunk_table();
+
+// Writes the indices of the non-zero 4-byte chunks of the fc0 input to `out` in
+// ascending order and returns their count. `out` needs 8 entries of slack past
+// the last chunk, since every step stores 8 indices.
+static inline int find_nonzero_fc0_chunks_neon(const uint8_t* act, uint16_t* out) {
+    alignas(16) static constexpr uint8_t kBitWeights[16] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                                            1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bit_weights = vld1q_u8(kBitWeights);
+    const uint16x8_t step = vdupq_n_u16(8);
+    uint16x8_t base = vdupq_n_u16(0);
+    int count = 0;
+    auto append = [&](uint32_t mask) {
+        vst1q_u16(out + count, vaddq_u16(base, vld1q_u16(kNonzeroChunkTable.index[mask])));
+        count += kNonzeroChunkTable.count[mask];
+        base = vaddq_u16(base, step);
+    };
+    for (int c = 0; c < kFc0InputChunks; c += 16) {
+        const uint8x16x4_t bytes = vld1q_u8_x4(act + 4 * c);
+        uint32x4_t nonzero[4];
+        for (int k = 0; k < 4; ++k) {
+            const uint32x4_t chunk = vreinterpretq_u32_u8(bytes.val[k]);
+            nonzero[k] = vtstq_u32(chunk, chunk);
+        }
+        const uint16x8_t lo = vcombine_u16(vmovn_u32(nonzero[0]), vmovn_u32(nonzero[1]));
+        const uint16x8_t hi = vcombine_u16(vmovn_u32(nonzero[2]), vmovn_u32(nonzero[3]));
+        const uint8x16_t flags = vandq_u8(vcombine_u8(vmovn_u16(lo), vmovn_u16(hi)), bit_weights);
+        append(vaddv_u8(vget_low_u8(flags)));
+        append(vaddv_u8(vget_high_u8(flags)));
+    }
+    return count;
+}
+
+// fc0 dot products over the non-zero input chunks only. Each chunk's 4 bytes are
+// broadcast and dotted against its 8 weight vectors, so lane o of sums[k] is
+// output 4k + o. Two accumulator sets alternate between chunks to halve the
+// sdot dependency chain; integer sums are exact in any order.
+static inline void fc0_dot_sparse_neon(const uint8_t* act, const LoadedNetwork& network,
+                                       int32x4_t sums[kExpectedFc0OutputSize / 4]) {
+    static_assert(kExpectedFc0OutputSize == 32, "fc0 sparse kernel keeps 8 output vectors");
+    constexpr int kChunkBytes = kExpectedFc0OutputSize * 4;
+
+    alignas(16) uint16_t chunks[kFc0InputChunks + 8];
+    const int count = find_nonzero_fc0_chunks_neon(act, chunks);
+    const int8_t* weights = network.fc0_weight_chunked.data();
+
+    auto broadcast = [act](int chunk) {
+        uint32_t bytes;
+        std::memcpy(&bytes, act + 4 * chunk, sizeof(bytes));
+        return vreinterpretq_s8_u32(vdupq_n_u32(bytes));
+    };
+
+    int32x4_t a[8];
+    int32x4_t b[8];
+    for (int k = 0; k < 8; ++k) {
+        a[k] = vdupq_n_s32(0);
+        b[k] = vdupq_n_s32(0);
+    }
+
+    int i = 0;
+    for (; i + 1 < count; i += 2) {
+        const int8x16_t x0 = broadcast(chunks[i]);
+        const int8x16_t x1 = broadcast(chunks[i + 1]);
+        const int8_t* w0 = weights + chunks[i] * kChunkBytes;
+        const int8_t* w1 = weights + chunks[i + 1] * kChunkBytes;
+        for (int k = 0; k < 8; ++k) {
+            a[k] = vdotq_s32(a[k], vld1q_s8(w0 + 16 * k), x0);
+            b[k] = vdotq_s32(b[k], vld1q_s8(w1 + 16 * k), x1);
+        }
+    }
+    if (i < count) {
+        const int8x16_t x0 = broadcast(chunks[i]);
+        const int8_t* w0 = weights + chunks[i] * kChunkBytes;
+        for (int k = 0; k < 8; ++k) {
+            a[k] = vdotq_s32(a[k], vld1q_s8(w0 + 16 * k), x0);
+        }
+    }
+
+    for (int k = 0; k < 8; ++k) {
+        sums[k] = vaddq_s32(a[k], b[k]);
+    }
+}
+#endif
+
+// Forward pass that keeps everything after fc0 in registers: fc0 sums come back
+// as vectors, the rounding divisions, bias adds, clamps and the screlu table
+// lookup run lane-wise, and fc1/fc2 read their inputs from registers instead of
+// byte-written buffers. Bit-identical to evaluate_accumulators_int_quantized_generic.
+IntEvaluationResult evaluate_accumulators_int_quantized_neon(const AccumulatorView& accumulators,
+                                                             const LoadedNetwork& network,
+                                                             int colour_to_move) {
+    static_assert(kExpectedFc0OutputSize == 32, "fc0 output must fill two uint8x16 vectors");
+    static_assert(kExpectedFc1OutputSize == 32, "fc1 output must fill two uint8x16 vectors");
+    static_assert(kFc1InputPaddedSize == 64, "fc1 input must fill four uint8x16 vectors");
+
+    alignas(64) std::array<uint8_t, kFc0InputSize> act;
+
+    const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
+    const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
+
+    ft_pairwise_screlu(us.data(), act.data(), kFtActivationHalf, network.ft_one, network.act_shift);
+    ft_pairwise_screlu(them.data(), act.data() + kFtActivationHalf,
+                       kFtActivationHalf, network.ft_one, network.act_shift);
+
+    // fc0: bias + div_round(dot, act_one), wrapped to int32 like the generic path.
+    const RoundingDividerNeon div_act_one(network.div_act_one);
+    int32x4_t fc0[kExpectedFc0OutputSize / 4];
+#if defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t fc0_dot[kExpectedFc0OutputSize / 4];
+    fc0_dot_sparse_neon(act.data(), network, fc0_dot);
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
+        fc0[j / 4] = vaddq_s32(vld1q_s32(network.fc0_bias.data() + j), div_act_one.div_round(fc0_dot[j / 4]));
+    }
+#else
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
+        const int32x4_t dot = dot_u8_i8_x4_neon(act.data(),
+                                                network.fc0_weight_t[j].data(),
+                                                network.fc0_weight_t[j + 1].data(),
+                                                network.fc0_weight_t[j + 2].data(),
+                                                network.fc0_weight_t[j + 3].data(),
+                                                kFc0InputSize);
+        fc0[j / 4] = vaddq_s32(vld1q_s32(network.fc0_bias.data() + j), div_act_one.div_round(dot));
+    }
+#endif
+    const int32_t forward = vgetq_lane_s32(fc0[kExpectedHiddenSize / 4], kExpectedHiddenSize % 4);
+
+    // CReLU to [0, qfc0], then screlu_lut over those bytes.
+    const int32x4_t zero = vdupq_n_s32(0);
+    const int32x4_t qfc0 = vdupq_n_s32(network.qfc0);
+    int32x4_t crelu[kExpectedFc0OutputSize / 4];
+    for (int k = 0; k < static_cast<int>(kExpectedFc0OutputSize / 4); ++k) {
+        crelu[k] = vminq_s32(vmaxq_s32(fc0[k], zero), qfc0);
+    }
+    const uint8x16_t crelu_lo = narrow_u8_neon(crelu[0], crelu[1], crelu[2], crelu[3]);
+    const uint8x16_t crelu_hi = narrow_u8_neon(crelu[4], crelu[5], crelu[6], crelu[7]);
+
+    const uint8_t* lut = network.screlu_lut.data();
+    const uint8x16x4_t lut0 = vld1q_u8_x4(lut);
+    const uint8x16x4_t lut1 = vld1q_u8_x4(lut + 64);
+    const uint8x16x4_t lut2 = vld1q_u8_x4(lut + 128);
+    const uint8x16x4_t lut3 = vld1q_u8_x4(lut + 192);
+    const uint8x16_t step = vdupq_n_u8(64);
+    auto screlu = [&](uint8x16_t c) {
+        uint8x16_t r = vqtbl4q_u8(lut0, c);
+        c = vsubq_u8(c, step);
+        r = vqtbx4q_u8(r, lut1, c);
+        c = vsubq_u8(c, step);
+        r = vqtbx4q_u8(r, lut2, c);
+        c = vsubq_u8(c, step);
+        return vqtbx4q_u8(r, lut3, c);
+    };
+
+    uint8x16x4_t fc1_table;
+    fc1_table.val[0] = screlu(crelu_lo);
+    fc1_table.val[1] = screlu(crelu_hi);
+    fc1_table.val[2] = crelu_lo;
+    fc1_table.val[3] = crelu_hi;
+
+    int8x16_t x[4];
+    for (int k = 0; k < 4; ++k) {
+        x[k] = vreinterpretq_s8_u8(vqtbl4q_u8(fc1_table, vld1q_u8(kFc1InputGather.index + 16 * k)));
+    }
+
+    // fc1: CReLU(bias + div_round(dot, qfc0)) to [0, qfc1]. The generic path adds in
+    // int64 before clamping; a saturating int32 add clamps to the same value.
+    const RoundingDividerNeon div_qfc0(network.div_qfc0);
+    const int32x4_t qfc1 = vdupq_n_s32(network.qfc1);
+    int32x4_t fc1[kExpectedFc1OutputSize / 4];
+    for (int j = 0; j < static_cast<int>(kExpectedFc1OutputSize); j += 4) {
+        int32x4_t rows[4];
+        for (int r = 0; r < 4; ++r) {
+            const int8_t* w = network.fc1_weight_t[j + r].data();
+            const int32x4_t even = dot_acc_s8_neon(dot_acc_s8_neon(vdupq_n_s32(0), x[0], vld1q_s8(w)),
+                                                   x[2], vld1q_s8(w + 32));
+            const int32x4_t odd = dot_acc_s8_neon(dot_acc_s8_neon(vdupq_n_s32(0), x[1], vld1q_s8(w + 16)),
+                                                  x[3], vld1q_s8(w + 48));
+            rows[r] = vaddq_s32(even, odd);
+        }
+        const int32x4_t dot = reduce_x4_neon(rows[0], rows[1], rows[2], rows[3]);
+        const int32x4_t sum = vqaddq_s32(vld1q_s32(network.fc1_bias.data() + j), div_qfc0.div_round(dot));
+        fc1[j / 4] = vminq_s32(vmaxq_s32(sum, zero), qfc1);
+    }
+    const int8x16_t a1_lo = vreinterpretq_s8_u8(narrow_u8_neon(fc1[0], fc1[1], fc1[2], fc1[3]));
+    const int8x16_t a1_hi = vreinterpretq_s8_u8(narrow_u8_neon(fc1[4], fc1[5], fc1[6], fc1[7]));
+
+    const int32x4_t fc2_acc = dot_acc_s8_neon(dot_acc_s8_neon(vdupq_n_s32(0), a1_lo,
+                                                              vld1q_s8(network.fc2_weight.data())),
+                                              a1_hi, vld1q_s8(network.fc2_weight.data() + 16));
+    const int32_t fc2_dot = vaddvq_s32(fc2_acc);
+    return {
+        static_cast<int32_t>(static_cast<int64_t>(network.fc2_bias) +
+                             network.div_qfc1.div_round(fc2_dot)),
+        forward
+    };
+}
+#endif
+
+#if defined(USE_AVX2) || (defined(USE_AVX512) && defined(__AVX512VNNI__))
+// The x86 dot products read u8 x i8 operands, so |sum| <= inputs * 255 * 128.
+// Adding the rounding half (< 128) must stay below 2^31, where the vector
+// multiply-shift quotient below is exact.
+static_assert(static_cast<int64_t>(kFc0InputSize) * 255 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc0 dot products exceed the exact multiply-shift range");
+static_assert(static_cast<int64_t>(kFc1InputPaddedSize) * 255 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc1 dot products exceed the exact multiply-shift range");
+static_assert(255 * 255 + 128 < (int64_t{1} << RoundingDivider::kMagicBits),
+              "squared activation exceeds the exact multiply-shift range");
+
+// Accumulates the u8 x i8 products of 32-byte x and w into the eight int32 lanes
+// of acc. It pairs bytes exactly as this build's dense kernels do (VNNI is exact;
+// the maddubs fallback saturates the same byte pairs), so every sum matches theirs.
+static inline __m256i forward_dot_acc_avx2(__m256i acc, __m256i x, __m256i w) {
+#if defined(USE_AVX512)
+    const __m512i x512 = _mm512_inserti64x4(_mm512_setzero_si512(), x, 0);
+    const __m512i w512 = _mm512_inserti64x4(_mm512_setzero_si512(), w, 0);
+    return _mm512_castsi512_si256(_mm512_dpbusd_epi32(_mm512_castsi256_si512(acc), x512, w512));
+#else
+    return add_dot_u8_i8_epi32(acc, x, w, _mm256_set1_epi16(1));
+#endif
+}
+
+// Folds four per-row partial-sum vectors into {sum(r0), sum(r1), sum(r2), sum(r3)}.
+static inline __m128i forward_reduce_x4_avx2(__m256i r0, __m256i r1, __m256i r2, __m256i r3) {
+    const __m256i sums = _mm256_hadd_epi32(_mm256_hadd_epi32(r0, r1), _mm256_hadd_epi32(r2, r3));
+    return _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+}
+
+// Four fc0 dot products of x against w0..w3, returned as one vector of the four sums.
+static inline __m128i forward_fc0_dot_x4(const uint8_t* x,
+                                         const int8_t* w0,
+                                         const int8_t* w1,
+                                         const int8_t* w2,
+                                         const int8_t* w3) {
+#if defined(USE_AVX512)
+    int32_t s0;
+    int32_t s1;
+    int32_t s2;
+    int32_t s3;
+    dot_u8_i8_x4_avx512(x, w0, w1, w2, w3, kFc0InputSize, s0, s1, s2, s3);
+    return _mm_setr_epi32(s0, s1, s2, s3);
+#else
+    __m256i a00 = _mm256_setzero_si256();
+    __m256i a01 = _mm256_setzero_si256();
+    __m256i a10 = _mm256_setzero_si256();
+    __m256i a11 = _mm256_setzero_si256();
+    __m256i a20 = _mm256_setzero_si256();
+    __m256i a21 = _mm256_setzero_si256();
+    __m256i a30 = _mm256_setzero_si256();
+    __m256i a31 = _mm256_setzero_si256();
+
+    for (int i = 0; i < kFc0InputSize; i += 64) {
+        const __m256i xv0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+        const __m256i xv1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 32));
+        a00 = forward_dot_acc_avx2(a00, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i)));
+        a01 = forward_dot_acc_avx2(a01, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i + 32)));
+        a10 = forward_dot_acc_avx2(a10, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i)));
+        a11 = forward_dot_acc_avx2(a11, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i + 32)));
+        a20 = forward_dot_acc_avx2(a20, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i)));
+        a21 = forward_dot_acc_avx2(a21, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i + 32)));
+        a30 = forward_dot_acc_avx2(a30, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i)));
+        a31 = forward_dot_acc_avx2(a31, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i + 32)));
+    }
+
+    return forward_reduce_x4_avx2(_mm256_add_epi32(a00, a01), _mm256_add_epi32(a10, a11),
+                                  _mm256_add_epi32(a20, a21), _mm256_add_epi32(a30, a31));
+#endif
+}
+
+// Lane-wise RoundingDivider::div_round for |v| + half < 2^31 (see the bounds
+// above): q = ((|v| + half) * magic) >> shift with full 64-bit products of the
+// even and odd lanes, then the sign of v reapplied, so each lane equals the
+// scalar result.
+struct RoundingDividerAvx2 {
+    __m256i magic;
+    __m128i shift;
+    __m256i half;
+
+    explicit RoundingDividerAvx2(const RoundingDivider& divider)
+        : magic(_mm256_set1_epi32(static_cast<int32_t>(static_cast<uint32_t>(divider.magic)))),
+          shift(_mm_cvtsi32_si128(static_cast<int>(divider.shift))),
+          half(_mm256_set1_epi32(static_cast<int32_t>(divider.half))) {}
+
+    __m256i div_round(__m256i v) const {
+        const __m256i n = _mm256_add_epi32(_mm256_abs_epi32(v), half);
+        const __m256i even = _mm256_srl_epi64(_mm256_mul_epu32(n, magic), shift);
+        const __m256i odd = _mm256_srl_epi64(_mm256_mul_epu32(_mm256_srli_epi64(n, 32), magic), shift);
+        const __m256i q = _mm256_blend_epi32(even, _mm256_slli_epi64(odd, 32), 0xAA);
+        return _mm256_sign_epi32(q, v);
+    }
+};
+
+// Narrows four int32x8 vectors already clamped to [0, 255] into 32 bytes in order.
+static inline __m256i narrow_u8_avx2(__m256i v0, __m256i v1, __m256i v2, __m256i v3) {
+    const __m256i bytes = _mm256_packus_epi16(_mm256_packs_epi32(v0, v1), _mm256_packs_epi32(v2, v3));
+    return _mm256_permutevar8x32_epi32(bytes, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+}
+
+// Forward pass that keeps everything after fc0 in registers, the x86 twin of
+// evaluate_accumulators_int_quantized_neon: the rounding divisions, bias adds and
+// clamps run lane-wise, the squared activation is computed instead of looked up,
+// and fc1/fc2 read their inputs from registers. Bit-identical to
+// evaluate_accumulators_int_quantized_generic.
+IntEvaluationResult evaluate_accumulators_int_quantized_avx2(const AccumulatorView& accumulators,
+                                                             const LoadedNetwork& network,
+                                                             int colour_to_move) {
+    static_assert(kExpectedFc0OutputSize == 32, "fc0 output must fill four int32x8 vectors");
+    static_assert(kExpectedFc1OutputSize == 32, "fc1 output must fill four int32x8 vectors");
+    static_assert(kExpectedHiddenSize == 31 && kFc1InputPaddedSize == 64,
+                  "fc1 input assembly assumes [screlu(31) | crelu(31) | 0, 0]");
+
+    alignas(64) std::array<uint8_t, kFc0InputSize> act;
+
+    const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
+    const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
+
+    ft_pairwise_screlu(us.data(), act.data(), kFtActivationHalf, network.ft_one, network.act_shift);
+    ft_pairwise_screlu(them.data(), act.data() + kFtActivationHalf,
+                       kFtActivationHalf, network.ft_one, network.act_shift);
+
+    // fc0: bias + div_round(dot, act_one), wrapped to int32 like the generic path.
+    const RoundingDividerAvx2 div_act_one(network.div_act_one);
+    __m256i fc0[kExpectedFc0OutputSize / 8];
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 8) {
+        const __m128i lo = forward_fc0_dot_x4(act.data(),
+                                              network.fc0_weight_t[j].data(),
+                                              network.fc0_weight_t[j + 1].data(),
+                                              network.fc0_weight_t[j + 2].data(),
+                                              network.fc0_weight_t[j + 3].data());
+        const __m128i hi = forward_fc0_dot_x4(act.data(),
+                                              network.fc0_weight_t[j + 4].data(),
+                                              network.fc0_weight_t[j + 5].data(),
+                                              network.fc0_weight_t[j + 6].data(),
+                                              network.fc0_weight_t[j + 7].data());
+        const __m256i dot = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+        const __m256i bias = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(network.fc0_bias.data() + j));
+        fc0[j / 8] = _mm256_add_epi32(bias, div_act_one.div_round(dot));
+    }
+    alignas(32) int32_t forward_lanes[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(forward_lanes), fc0[kExpectedHiddenSize / 8]);
+    const int32_t forward = forward_lanes[kExpectedHiddenSize % 8];
+
+    // CReLU to [0, qfc0], and screlu_lut[c] == div_round(c * c, qfc0) computed directly.
+    const RoundingDividerAvx2 div_qfc0(network.div_qfc0);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i qfc0 = _mm256_set1_epi32(network.qfc0);
+    __m256i crelu[kExpectedFc0OutputSize / 8];
+    __m256i screlu[kExpectedFc0OutputSize / 8];
+    for (int k = 0; k < static_cast<int>(kExpectedFc0OutputSize / 8); ++k) {
+        crelu[k] = _mm256_min_epi32(_mm256_max_epi32(fc0[k], zero), qfc0);
+        screlu[k] = div_qfc0.div_round(_mm256_mullo_epi32(crelu[k], crelu[k]));
+    }
+    const __m256i crelu_bytes = narrow_u8_avx2(crelu[0], crelu[1], crelu[2], crelu[3]);
+    const __m256i screlu_bytes = narrow_u8_avx2(screlu[0], screlu[1], screlu[2], screlu[3]);
+
+    // fc1 input [screlu 0..30 | crelu 0..30 | 0, 0]: byte 31 takes crelu 0, and the
+    // upper 32 bytes are crelu shifted down one byte with the last two cleared.
+    const __m256i keep_31 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0);
+    const __m256i keep_30 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0);
+    const __m256i crelu_first_at_31 =
+        _mm256_slli_si256(_mm256_permute2x128_si256(crelu_bytes, crelu_bytes, 0x08), 15);
+    const __m256i crelu_down_one =
+        _mm256_alignr_epi8(_mm256_permute2x128_si256(crelu_bytes, crelu_bytes, 0x81), crelu_bytes, 1);
+    const __m256i x0 = _mm256_or_si256(_mm256_and_si256(screlu_bytes, keep_31), crelu_first_at_31);
+    const __m256i x1 = _mm256_and_si256(crelu_down_one, keep_30);
+
+    // fc1: CReLU(bias + div_round(dot, qfc0)) to [0, qfc1]. The generic path adds in
+    // int64 before clamping; |div_round(dot)| < 2^21, so clamping the bias to
+    // +-2^30 first keeps the int32 add exact without changing the clamped result.
+    const __m256i qfc1 = _mm256_set1_epi32(network.qfc1);
+    const __m256i bias_max = _mm256_set1_epi32(1 << 30);
+    const __m256i bias_min = _mm256_set1_epi32(-(1 << 30));
+    __m256i fc1[kExpectedFc1OutputSize / 8];
+    for (int j = 0; j < static_cast<int>(kExpectedFc1OutputSize); j += 8) {
+        __m128i half_dots[2];
+        for (int h = 0; h < 2; ++h) {
+            __m256i rows[4];
+            for (int r = 0; r < 4; ++r) {
+                const int8_t* w = network.fc1_weight_t[j + 4 * h + r].data();
+                rows[r] = forward_dot_acc_avx2(
+                    forward_dot_acc_avx2(zero, x0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w))),
+                    x1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 32)));
+            }
+            half_dots[h] = forward_reduce_x4_avx2(rows[0], rows[1], rows[2], rows[3]);
+        }
+        const __m256i dot = _mm256_inserti128_si256(_mm256_castsi128_si256(half_dots[0]), half_dots[1], 1);
+        const __m256i bias = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(network.fc1_bias.data() + j)),
+                             bias_min),
+            bias_max);
+        const __m256i sum = _mm256_add_epi32(bias, div_qfc0.div_round(dot));
+        fc1[j / 8] = _mm256_min_epi32(_mm256_max_epi32(sum, zero), qfc1);
+    }
+    const __m256i a1 = narrow_u8_avx2(fc1[0], fc1[1], fc1[2], fc1[3]);
+
+    const __m256i fc2_acc = forward_dot_acc_avx2(
+        zero, a1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(network.fc2_weight.data())));
+    const __m128i fc2_sum4 = _mm_add_epi32(_mm256_castsi256_si128(fc2_acc), _mm256_extracti128_si256(fc2_acc, 1));
+    const __m128i fc2_sum2 = _mm_add_epi32(fc2_sum4, _mm_unpackhi_epi64(fc2_sum4, fc2_sum4));
+    const int32_t fc2_dot = _mm_cvtsi128_si32(fc2_sum2) + _mm_extract_epi32(fc2_sum2, 1);
+    return {
+        static_cast<int32_t>(static_cast<int64_t>(network.fc2_bias) +
+                             network.div_qfc1.div_round(fc2_dot)),
+        forward
+    };
+}
+#endif
+
+IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
+                                                        const LoadedNetwork& network,
+                                                        int colour_to_move) {
+#if defined(USE_NEON)
+    return evaluate_accumulators_int_quantized_neon(accumulators, network, colour_to_move);
+#elif defined(USE_AVX2) || (defined(USE_AVX512) && defined(__AVX512VNNI__))
+    return evaluate_accumulators_int_quantized_avx2(accumulators, network, colour_to_move);
+#else
+    return evaluate_accumulators_int_quantized_generic(accumulators, network, colour_to_move);
+#endif
 }
 
 double raw_output_from_quantized(const IntEvaluationResult& result,
@@ -2112,7 +2801,7 @@ int32_t evaluate_accumulators_int_cp(const AccumulatorView& accumulators,
         evaluate_accumulators_int_quantized(accumulators, network, colour_to_move);
     return round_to_int32(raw_output_from_quantized(result, network) *
                           static_cast<double>(network.score_scale) *
-                          kCpPerStockfishScore);
+                          kCpPerNetworkScore);
 }
 
 // Thrawn's search margins and mate bounds are cp-based, so the NNUE score_stm
@@ -2190,7 +2879,7 @@ double evaluate_accumulators_float_cp(const AccumulatorView& accumulators,
                                       const LoadedNetwork& network,
                                       int colour_to_move) {
     return evaluate_accumulators_float_score_stm(accumulators, network, colour_to_move) *
-           kCpPerStockfishScore;
+           kCpPerNetworkScore;
 }
 
 bool verify_state_against_board(const thrawn::Position* pos,
@@ -2217,34 +2906,18 @@ bool verify_state_against_board(const thrawn::Position* pos,
         return fail("incremental state invalid");
     }
 
+    // Materializing lazy accumulators is logically const (see state_for_evaluation).
     AccumulatorView incremental_accumulators{};
-    if (!accumulator_view_for_ply(pos, pos->ply, incremental_accumulators)) {
+    if (!ensure_accumulators(const_cast<thrawn::Position*>(pos), pos->ply, network,
+                             incremental_accumulators)) {
         return fail("incremental accumulator source invalid");
     }
 
-    if (incremental.piece_count != rebuilt.piece_count) {
-        return fail("piece count mismatch");
-    }
-    if (incremental.white_king_sq != rebuilt.white_king_sq ||
-        incremental.black_king_sq != rebuilt.black_king_sq) {
-        return fail("king square mismatch");
-    }
     if (*incremental_accumulators.white != rebuilt.white_acc) {
         return fail("white accumulator mismatch");
     }
     if (*incremental_accumulators.black != rebuilt.black_acc) {
         return fail("black accumulator mismatch");
-    }
-
-    for (int square = 0; square < BOARD_SIZE; ++square) {
-        const int inc_index = incremental.index_by_square[square];
-        const int ref_index = rebuilt.index_by_square[square];
-        if ((inc_index == -1) != (ref_index == -1)) {
-            return fail("piece presence mismatch");
-        }
-        if (inc_index != -1 && incremental.piece_list[inc_index] != rebuilt.piece_list[ref_index]) {
-            return fail("piece identity mismatch");
-        }
     }
 
     const IntEvaluationResult incremental_raw =
@@ -2497,6 +3170,17 @@ bool load_network_from_stream(std::istream& stream,
     network.inv_fc1_scale = 1.0f / fc1_scale;
     network.inv_fc2_scale = 1.0f / fc2_scale;
 
+    if (!network.div_act_one.init(act_one) ||
+        !network.div_qfc0.init(qfc0) ||
+        !network.div_qfc1.init(qfc1)) {
+        error = "output scales out of range";
+        return false;
+    }
+    for (int c = 0; c < 256; ++c) {
+        network.screlu_lut[static_cast<std::size_t>(c)] = static_cast<uint8_t>(
+            div_round_by_scale(static_cast<int64_t>(c) * c, qfc0));
+    }
+
     std::copy(ft_bias_q.begin(), ft_bias_q.end(), network.ft_bias.begin());
     network.ft_weight = std::move(ft_weight_q);
     std::copy(fc0_bias_q.begin(), fc0_bias_q.end(), network.fc0_bias.begin());
@@ -2508,6 +3192,15 @@ bool load_network_from_stream(std::istream& stream,
                 fc0_weight_q[static_cast<std::size_t>(i) * kExpectedFc0OutputSize + j];
         }
     }
+#if defined(USE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int i = 0; i < kFc0InputSize; ++i) {
+        for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); ++j) {
+            network.fc0_weight_chunked[static_cast<std::size_t>(i / 4) * kExpectedFc0OutputSize * 4 +
+                                       static_cast<std::size_t>(j) * 4 + static_cast<std::size_t>(i % 4)] =
+                network.fc0_weight_t[j][i];
+        }
+    }
+#endif
 
     for (int j = 0; j < static_cast<int>(kExpectedFc1OutputSize); ++j) {
         for (int i = 0; i < static_cast<int>(kExpectedFc1InputSize); ++i) {
@@ -2565,6 +3258,7 @@ void activate_network(LoadedNetwork&& loaded) {
     std::lock_guard<std::mutex> lock(g_network_mutex);
     g_network_owner = network;
     g_network_raw.store(network.get(), std::memory_order_release);
+    g_network_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void nnue_init(const char* evalFile) {
@@ -2618,6 +3312,7 @@ void nnue_init(const char* evalFile) {
         std::lock_guard<std::mutex> lock(g_network_mutex);
         g_network_owner.reset();
         g_network_raw.store(nullptr, std::memory_order_release);
+        g_network_generation.fetch_add(1, std::memory_order_acq_rel);
     }
 
     std::cout << "info string Failed to load NNUE";
@@ -2638,9 +3333,8 @@ int nnue_evaluate(thrawn::Position* pos) {
     }
 
     if (pos->ply >= 0 && pos->ply <= MAX_DEPTH) {
-        const thrawn::NnueState& live_state = pos->nnue_stack[pos->ply];
         AccumulatorView accumulators{};
-        if (live_state.valid && accumulator_view_for_ply(pos, pos->ply, accumulators)) {
+        if (ensure_accumulators(pos, pos->ply, *network, accumulators)) {
             return evaluate_accumulators_int_engine_score(accumulators, *network, pos->colour_to_move);
         }
     }
@@ -2696,14 +3390,19 @@ void nnue_copy_parent_to_child(thrawn::Position* pos, int child_ply) {
 
     thrawn::NnueState& child = pos->nnue_stack[child_ply];
     const thrawn::NnueState& parent = pos->nnue_stack[child_ply - 1];
+    child.dirty_count = 0;
     if (current_network() == nullptr || !parent.valid) {
         child.valid = false;
-        child.white_acc_source_ply = kLocalAccumulatorSource;
-        child.black_acc_source_ply = kLocalAccumulatorSource;
+        child.white_acc_ply = kUncomputedAccumulator;
+        child.black_acc_ply = kUncomputedAccumulator;
         return;
     }
 
-    copy_state_metadata_without_accumulators(child, parent, child_ply);
+    // With no piece changes (a null move) the child's accumulators are the
+    // parent's; a real move resets them in nnue_apply_piece_updates.
+    child.valid = true;
+    child.white_acc_ply = parent.white_acc_ply;
+    child.black_acc_ply = parent.black_acc_ply;
 }
 
 void nnue_promote_to_root(thrawn::Position* pos, int ply) {
@@ -2712,32 +3411,35 @@ void nnue_promote_to_root(thrawn::Position* pos, int ply) {
     }
 
     thrawn::NnueState& root = pos->nnue_stack[0];
-    if (current_network() == nullptr) {
+    const LoadedNetwork* network = current_network();
+    AccumulatorView accumulators{};
+    if (network == nullptr || ply != pos->ply ||
+        !ensure_accumulators(pos, ply, *network, accumulators)) {
         root.valid = false;
-        root.white_acc_source_ply = kLocalAccumulatorSource;
-        root.black_acc_source_ply = kLocalAccumulatorSource;
+        root.white_acc_ply = kUncomputedAccumulator;
+        root.black_acc_ply = kUncomputedAccumulator;
+        root.dirty_count = 0;
         return;
     }
 
-    if (!pos->nnue_stack[ply].valid || !materialize_state_accumulators(pos, ply)) {
-        root.valid = false;
-        root.white_acc_source_ply = kLocalAccumulatorSource;
-        root.black_acc_source_ply = kLocalAccumulatorSource;
-        return;
+    if (accumulators.white != &root.white_acc) {
+        root.white_acc = *accumulators.white;
     }
-
-    root = pos->nnue_stack[ply];
-    root.white_acc_source_ply = kLocalAccumulatorSource;
-    root.black_acc_source_ply = kLocalAccumulatorSource;
+    if (accumulators.black != &root.black_acc) {
+        root.black_acc = *accumulators.black;
+    }
+    root.white_acc_ply = 0;
+    root.black_acc_ply = 0;
+    root.dirty_count = 0;
+    root.valid = true;
 }
 
+// Record the move's piece changes for lazy replay; no accumulator work here.
 void nnue_apply_piece_updates(thrawn::Position* pos,
                               int ply,
                               const NnuePieceUpdate* updates,
                               int update_count) {
-    const LoadedNetwork* network = current_network();
-    if (network == nullptr ||
-        pos == nullptr ||
+    if (pos == nullptr ||
         updates == nullptr ||
         update_count < 0 ||
         ply < 0 ||
@@ -2746,13 +3448,22 @@ void nnue_apply_piece_updates(thrawn::Position* pos,
     }
 
     thrawn::NnueState& state = pos->nnue_stack[ply];
-    if (!state.valid) {
+    if (!state.valid || update_count == 0) {
+        return;
+    }
+    if (update_count > thrawn::NNUE_MAX_DIRTY_PIECES) {
+        state.valid = false;
         return;
     }
 
-    if (!apply_piece_updates_to_state(pos, ply, state, *network, updates, update_count)) {
-        state.valid = false;
+    for (int i = 0; i < update_count; ++i) {
+        state.dirty[i] = {static_cast<int8_t>(updates[i].piece),
+                          static_cast<int8_t>(updates[i].square),
+                          updates[i].add};
     }
+    state.dirty_count = static_cast<uint8_t>(update_count);
+    state.white_acc_ply = kUncomputedAccumulator;
+    state.black_acc_ply = kUncomputedAccumulator;
 }
 
 
